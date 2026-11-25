@@ -1,0 +1,24 @@
+[package]
+name = "bezel-rdp"
+description = "Bezel's Session engine on IronRDP. No IronRDP type crosses its interface."
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+publish.workspace = true
+
+[lints]
+workspace = true
+
+[dependencies]
+anyhow.workspace = true
+bezel-core.workspace = true
+ironrdp-client.workspace = true
+ironrdp-connector.workspace = true
+ironrdp-input.workspace = true
+ironrdp-pdu.workspace = true
+ironrdp-session.workspace = true
+ironrdp-tls.workspace = true
+rune-image.workspace = true
+thiserror.workspace = true
+tokio.workspace = true
+tracing.workspace = true
