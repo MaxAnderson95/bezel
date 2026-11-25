@@ -1,0 +1,280 @@
+//! The Main window's sidebar: Groups in Max's order with their Connections alphabetically,
+//! Ungrouped last, status dots, hover actions, context menus and dragging, and a foot with
+//! Credentials, Certificates and +.
+
+use std::rc::Rc;
+
+use bezel_core::library::{ConnectionId, GroupId, Section, Snapshot};
+use rune::{Drag, El, PointerPress, PopupItem, PopupMenu, Tx, col, el, row, text};
+use rune_kit::shell::RowStatus;
+use rune_kit::{
+    Button, ButtonVariant, ControlSize, IconButton, IconButtonVariant, Kit, Sidebar, SidebarHeader, SidebarRow,
+};
+use rune_theme_opencode::icons;
+
+use crate::app::{Bezel, Dot, Library};
+use crate::manage::{Delete, Dragged, DropTargets};
+
+pub const WIDTH: f32 = 240.0;
+
+pub fn sidebar(s: &Bezel, k: &Kit) -> El {
+    let column = col().key("sidebar-column").w(WIDTH).h_full().min_h(0.0);
+    let list = match &s.library {
+        Library::Ready(snapshot) => connections(s, snapshot, k),
+        Library::Loading => Sidebar::new(),
+        Library::Failed(_) => Sidebar::new().child(faint(k, "Bezel can't read its data file")),
+    };
+    column.child(list.label("Connections").footer(foot(s, k)).build(k))
+}
+
+fn faint(k: &Kit, message: &str) -> El {
+    row().w_full().px(8.0).py(6.0).child(
+        text(message.to_owned())
+            .font(k.ty.ui)
+            .color(k.c.text_faint)
+            .wrap()
+            .w_full(),
+    )
+}
+
+fn section_key(group: Option<&GroupId>) -> String {
+    match group {
+        Some(id) => format!("section-{id}"),
+        None => "section-ungrouped".into(),
+    }
+}
+
+fn connections(s: &Bezel, snapshot: &Snapshot, k: &Kit) -> Sidebar {
+    let sections = snapshot.sections();
+    if snapshot.connections.is_empty() && snapshot.groups.is_empty() {
+        return Sidebar::new().child(faint(k, "No connections yet"));
+    }
+    let targets: DropTargets = Rc::new(
+        sections
+            .iter()
+            .map(|s| {
+                let group = s.group.map(|g| g.id.clone());
+                (section_key(group.as_ref()), group)
+            })
+            .collect(),
+    );
+    let mut list = Sidebar::new();
+    for (index, section) in sections.iter().enumerate() {
+        list = list.child(section_el(s, snapshot, section, index, &targets, k));
+    }
+    list
+}
+
+fn section_el(
+    s: &Bezel,
+    snapshot: &Snapshot,
+    section: &Section<'_>,
+    index: usize,
+    targets: &DropTargets,
+    k: &Kit,
+) -> El {
+    let group = section.group.map(|g| g.id.clone());
+    let title = section.group.map_or("Ungrouped", |g| g.name.as_str());
+    let mut header = SidebarHeader::new(title).build(k);
+    if let Some(id) = group.clone() {
+        let count = snapshot.groups.len();
+        let menu_id = id.clone();
+        let targets = targets.clone();
+        header = header
+            .on_secondary_press(move |_: &mut Bezel, press: PointerPress, tx: &mut Tx| {
+                group_menu(menu_id.clone(), index, count, press, tx)
+            })
+            .on_drag(move |s: &mut Bezel, d: &mut Drag, tx: &mut Tx| {
+                s.drag(Dragged::Group(id.clone()), d, &targets, tx)
+            });
+    }
+    let mut column = col()
+        .key(section_key(group.as_ref()))
+        .role("group")
+        .label(title.to_owned())
+        .w_full()
+        .gap(2.0)
+        .pb(8.0)
+        .child(header);
+    for connection in &section.connections {
+        column = column.child(connection_row(
+            s,
+            snapshot,
+            &connection.id,
+            &connection.name,
+            targets,
+            k,
+        ));
+    }
+    match (&s.dragging, group) {
+        (Some(d), Some(group)) if d.item == Dragged::Group(group.clone()) => {
+            k.elevate(column.offset(d.dx, d.dy).raise().fill(k.c.bg_deep), &k.elevation.raised)
+        }
+        _ => column,
+    }
+}
+
+fn connection_row(s: &Bezel, snapshot: &Snapshot, id: &ConnectionId, name: &str, targets: &DropTargets, k: &Kit) -> El {
+    let dot = s.dot(id);
+    let actions = row()
+        .key("actions")
+        .gap(2.0)
+        .group_opacity(0.0, 1.0)
+        // Session windows arrive with Tabs; until then this opens the Connection here.
+        .child(
+            hover_action(k, &icons::SQUARE_ARROW_TOP_RIGHT, "Open in new window", id, |s, id| {
+                s.open(id)
+            })
+            .key("open-window"),
+        )
+        .child(hover_action(k, &icons::PENCIL_LINE, "Edit", id, |s, id| s.edit_connection(id)).key("edit"));
+    let mut sidebar_row = SidebarRow::new(name)
+        .icon(&icons::MONITOR)
+        .selected(dot.is_some())
+        .trailing(actions);
+    if let Some(dot) = dot {
+        let color = match dot {
+            Dot::Connected => k.c.success.icon,
+            Dot::Connecting => k.c.warning.icon,
+        };
+        sidebar_row = sidebar_row.status(RowStatus::Other(el().size(7.0, 7.0).radius(3.5).fill(color)));
+    }
+    let (open, menu, drag) = (id.clone(), id.clone(), id.clone());
+    let groups: Vec<(GroupId, String)> = snapshot.groups.iter().map(|g| (g.id.clone(), g.name.clone())).collect();
+    let current = snapshot.connection(id).and_then(|c| c.group.clone());
+    let targets = targets.clone();
+    let built = sidebar_row
+        .on_select(move |s: &mut Bezel, _: &mut Tx| s.open(&open))
+        .build(k)
+        .key(id.to_string())
+        .on_secondary_press(move |_: &mut Bezel, press: PointerPress, tx: &mut Tx| {
+            connection_menu(menu.clone(), &groups, current.as_ref(), press, tx)
+        })
+        .on_drag(move |s: &mut Bezel, d: &mut Drag, tx: &mut Tx| {
+            s.drag(Dragged::Connection(drag.clone()), d, &targets, tx)
+        });
+    match &s.dragging {
+        Some(d) if d.item == Dragged::Connection(id.clone()) => {
+            k.elevate(built.offset(d.dx, d.dy).raise().fill(k.c.pressed), &k.elevation.raised)
+        }
+        _ => built,
+    }
+}
+
+fn hover_action(
+    k: &Kit,
+    glyph: &'static rune::Icon,
+    label: &str,
+    id: &ConnectionId,
+    act: fn(&mut Bezel, &ConnectionId),
+) -> El {
+    let id = id.clone();
+    IconButton::new(glyph)
+        .variant(IconButtonVariant::GhostMuted)
+        .control_size(ControlSize::Small)
+        .label(label)
+        .on_press(move |s: &mut Bezel| act(s, &id))
+        .build(k)
+        // Pointer only, as the kit's row close button: the list's arrows step through rows.
+        .focusable(false)
+}
+
+fn connection_menu(
+    id: ConnectionId,
+    groups: &[(GroupId, String)],
+    current: Option<&GroupId>,
+    press: PointerPress,
+    tx: &mut Tx,
+) {
+    let move_to = groups.iter().fold(
+        PopupMenu::new().item(PopupItem::new("move:", "Ungrouped").checked(current.is_none())),
+        |menu, (group, name)| {
+            menu.item(PopupItem::new(format!("move:{group}"), name.clone()).checked(current == Some(group)))
+        },
+    );
+    let menu = PopupMenu::new()
+        .item(PopupItem::new("open", "Open"))
+        .item(PopupItem::new("open-window", "Open in new window"))
+        .item(PopupItem::new("edit", "Edit…"))
+        .item(PopupItem::new("duplicate", "Duplicate"))
+        .submenu("Move to group", move_to)
+        .separator()
+        .item(PopupItem::new("delete", "Delete…"));
+    tx.popup_menu(menu, press, move |s: &mut Bezel, picked, _| match picked {
+        // Session windows arrive with Tabs; until then a new window opens it here.
+        Some("open" | "open-window") => s.open(&id),
+        Some("edit") => s.edit_connection(&id),
+        Some("duplicate") => s.duplicate_connection(&id),
+        Some("delete") => s.ask_delete(Delete::Connection(id)),
+        Some(other) => {
+            if let Some(group) = other.strip_prefix("move:") {
+                s.move_connection(id, (!group.is_empty()).then(|| GroupId::from(group)));
+            }
+        }
+        None => {}
+    });
+}
+
+fn group_menu(id: GroupId, index: usize, count: usize, press: PointerPress, tx: &mut Tx) {
+    let menu = PopupMenu::new()
+        .item(PopupItem::new("new", "New connection…"))
+        .item(PopupItem::new("rename", "Rename…"))
+        .item(PopupItem::new("up", "Move up").enabled(index > 0))
+        .item(PopupItem::new("down", "Move down").enabled(index + 1 < count))
+        .separator()
+        .item(PopupItem::new("delete", "Delete…"));
+    tx.popup_menu(menu, press, move |s: &mut Bezel, picked, _| match picked {
+        Some("new") => s.new_connection(Some(id)),
+        Some("rename") => s.rename_group(&id),
+        Some("up") => s.step_group(&id, -1),
+        Some("down") => s.step_group(&id, 1),
+        Some("delete") => s.ask_delete(Delete::Group(id)),
+        _ => {}
+    });
+}
+
+fn foot(s: &Bezel, k: &Kit) -> El {
+    let ready = s.library.ready().is_some();
+    let link = |label: &'static str, glyph: &'static rune::Icon, key: &'static str, act: fn(&mut Bezel)| {
+        Button::new(label)
+            .icon(glyph)
+            .variant(ButtonVariant::GhostMuted)
+            .control_size(ControlSize::Small)
+            .disabled(!ready)
+            .on_press(act)
+            .build(k)
+            .key(key)
+    };
+    let add = IconButton::new(&icons::PLUS)
+        .variant(IconButtonVariant::GhostMuted)
+        .control_size(ControlSize::Small)
+        .label("Add")
+        .disabled(!ready)
+        .on_press_tx(|_: &mut Bezel, tx: &mut Tx| {
+            let menu = PopupMenu::new()
+                .item(PopupItem::new("connection", "New connection…"))
+                .item(PopupItem::new("group", "New group…"));
+            tx.popup_menu(menu, "sidebar-add", |s: &mut Bezel, picked, _| match picked {
+                Some("connection") => s.new_connection(None),
+                Some("group") => s.new_group(),
+                _ => {}
+            });
+        })
+        .build(k)
+        .key("sidebar-add");
+    row()
+        .w_full()
+        .gap(2.0)
+        .center_y()
+        .child(link("Credentials", &icons::LOCK, "sidebar-credentials", |s| {
+            s.open_credentials(None)
+        }))
+        .child(link(
+            "Certificates",
+            &icons::SHIELD,
+            "sidebar-certificates",
+            Bezel::open_certificates,
+        ))
+        .child(el().grow(1.0))
+        .child(add)
+}
