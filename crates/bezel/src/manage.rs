@@ -6,6 +6,7 @@ use std::rc::Rc;
 use bezel_core::address::Address;
 use bezel_core::library::{Change, Connection, ConnectionId, Credential, CredentialId, Group, GroupId};
 use bezel_core::secrets::Secret;
+use bezel_core::trust::Fingerprint;
 use rune::{Drag, Phase, TextEdit, Tx};
 
 use crate::app::{Bezel, today};
@@ -19,8 +20,8 @@ pub enum Sheet {
 }
 
 pub struct ConnectionForm {
-    /// `None` for a new Connection.
-    pub editing: Option<ConnectionId>,
+    /// The Connection as it was when the sheet opened; `None` for a new one.
+    pub editing: Option<Connection>,
     pub name: TextEdit,
     pub host: TextEdit,
     pub credential: Option<CredentialId>,
@@ -60,7 +61,8 @@ impl Credentials {
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum Selected {
     Nothing,
-    Existing(CredentialId),
+    /// A saved Credential, as it was when its fields were filled in.
+    Existing(Credential),
     /// A Credential being added, with the ID it will have.
     New(CredentialId),
 }
@@ -112,6 +114,13 @@ pub fn host_text(connection: &Connection) -> String {
     }
 }
 
+/// Takes `now` into a field still showing `before`.
+fn rebase(field: &mut TextEdit, before: &str, now: &str) {
+    if field.text.trim() == before {
+        *field = TextEdit::new(now);
+    }
+}
+
 fn focused(text: impl Into<String>) -> TextEdit {
     let mut edit = TextEdit::new(text);
     edit.focused = true;
@@ -140,7 +149,7 @@ impl Bezel {
             return;
         };
         self.sheet = Some(Sheet::Connection(ConnectionForm {
-            editing: Some(connection.id.clone()),
+            editing: Some(connection.clone()),
             name: focused(connection.name.clone()),
             host: TextEdit::new(host_text(connection)),
             credential: connection.credential.clone(),
@@ -178,15 +187,21 @@ impl Bezel {
             name => name.to_owned(),
         };
         let connection = Connection {
-            id: form.editing.clone().unwrap_or_else(ConnectionId::random),
+            id: form
+                .editing
+                .as_ref()
+                .map_or_else(ConnectionId::random, |c| c.id.clone()),
             name,
             host: address.host,
             port: address.port,
             credential: form.credential.clone(),
             group: form.group.clone(),
         };
-        let change = match form.editing {
-            Some(_) => Change::EditConnection(connection),
+        let change = match form.editing.clone() {
+            Some(original) => Change::EditConnection {
+                original,
+                edited: connection,
+            },
             None => Change::AddConnection(connection),
         };
         form.error = None;
@@ -302,7 +317,7 @@ impl Bezel {
             Delete::Group(id) => Change::DeleteGroup(id),
             Delete::Credential(id) => {
                 if let Some(Sheet::Credentials(sheet)) = &mut self.sheet
-                    && sheet.selected == Selected::Existing(id.clone())
+                    && matches!(&sheet.selected, Selected::Existing(c) if c.id == id)
                 {
                     sheet.selected = Selected::Nothing;
                 }
@@ -337,7 +352,7 @@ impl Bezel {
         let Some(credential) = self.library.ready().and_then(|s| s.credential(id)) else {
             return;
         };
-        sheet.selected = Selected::Existing(id.clone());
+        sheet.selected = Selected::Existing(credential.clone());
         sheet.name = TextEdit::new(credential.name.clone());
         sheet.username = TextEdit::new(credential.username.clone());
         sheet.password = TextEdit::default().secure();
@@ -395,19 +410,18 @@ impl Bezel {
                     password,
                 }
             }
-            Selected::Existing(id) => {
-                let Some(saved) = self.library.ready().and_then(|s| s.credential(id)) else {
-                    return;
+            Selected::Existing(original) => {
+                let edited = Credential {
+                    name,
+                    username,
+                    ..original.clone()
                 };
-                let name = (name != saved.name).then_some(name);
-                let username = (username != saved.username).then_some(username);
-                if name.is_none() && username.is_none() && typed.is_none() {
+                if edited == *original && typed.is_none() {
                     return;
                 }
                 Change::EditCredential {
-                    credential: id.clone(),
-                    name,
-                    username,
+                    original: original.clone(),
+                    edited,
                     password: typed,
                     today: today(),
                 }
@@ -424,8 +438,9 @@ impl Bezel {
         self.sheet = Some(Sheet::Certificates);
     }
 
-    pub fn forget_certificate(&mut self, host: String, port: u16) {
-        self.apply(Change::ForgetCertificate { host, port });
+    /// Forgets the Trusted certificate the list showed, unless another has replaced it since.
+    pub fn forget_certificate(&mut self, host: String, port: u16, sha256: Fingerprint) {
+        self.apply(Change::ForgetCertificate { host, port, sha256 });
     }
 
     /// Takes the reply to a sheet's save. False when no sheet was waiting for it.
@@ -440,16 +455,31 @@ impl Bezel {
             }
             Some(Sheet::Credentials(sheet)) if sheet.saving == Some(id) => {
                 sheet.saving = None;
+                let selected = match &sheet.selected {
+                    Selected::Existing(credential) => &credential.id,
+                    Selected::New(id) => id,
+                    Selected::Nothing => return true,
+                };
+                let Some(now) = self.library.ready().and_then(|s| s.credential(selected)) else {
+                    sheet.error = error.map(Into::into);
+                    return true;
+                };
                 match error {
                     None => {
-                        if let Selected::New(id) = &sheet.selected {
-                            sheet.selected = Selected::Existing(id.clone());
-                        }
                         sheet.password.clear();
                         sheet.error = None;
                     }
-                    Some(e) => sheet.error = Some(e.into()),
+                    // What the person didn't change follows the Credential as it is now, so
+                    // saving again doesn't put back what another Bezel changed meanwhile.
+                    Some(e) => {
+                        if let Selected::Existing(original) = &sheet.selected {
+                            rebase(&mut sheet.name, &original.name, &now.name);
+                            rebase(&mut sheet.username, &original.username, &now.username);
+                        }
+                        sheet.error = Some(e.into());
+                    }
                 }
+                sheet.selected = Selected::Existing(now.clone());
             }
             _ => return false,
         }

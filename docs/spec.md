@@ -57,7 +57,7 @@ Clicking a Connection, or choosing it in the palette, switches to its existing T
 ### Sign-in
 
 - A Connection with a Credential signs in with it silently.
-- A Connection set to "Ask each time", or a New host, shows a sign-in sheet: pick an existing Credential or type a username and password, with "Save as Credential" (off by default; asks for a name when ticked).
+- A Connection set to "Ask each time", or a New host, shows a sign-in sheet: pick an existing Credential or type a username and password, with "Save as Credential" (off by default; asks for a name when ticked). A Credential saved there for a Connection becomes that Connection's Credential once the sign-in succeeds.
 - **Wrong password.** When the server rejects the password, the Tab shows "Sign-in failed for Domain admin" with a password field. Saving updates that Credential in the Keychain for every Connection that uses it, then retries. For a one-off typed password, the sheet simply reappears.
 - Methods, tried automatically with nothing to configure: NLA (CredSSP) with Kerberos, finding the domain controller through DNS SRV records and `/etc/krb5.conf`, then NTLM. If the server has NLA turned off, Bezel connects over TLS and shows the Windows login screen, filling in the Credential when there is one. Servers offering only legacy RDP security without TLS are refused with a clear error.
 - Usernames are entered as one field: `DOMAIN\user`, `user@domain` or `user` (a local account). Bezel splits them for the protocol.

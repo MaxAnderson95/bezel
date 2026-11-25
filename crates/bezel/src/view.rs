@@ -230,10 +230,9 @@ fn connecting(k: &Kit, name: &str) -> El {
 /// The wrong-password prompt in place of the Session: a new password for the Credential, saved
 /// for every Connection that uses it.
 fn retry_card(s: &Bezel, retry: &Retry, k: &Kit) -> El {
-    let snapshot = s.library.ready();
-    let credential = snapshot.and_then(|l| l.credential(&retry.credential));
-    let name = credential.map_or("the credential", |c| c.name.as_str());
-    let users = snapshot.map_or(0, |l| l.used_by(&retry.credential).len());
+    let credential = &retry.credential;
+    let name = &credential.name;
+    let users = s.library.ready().map_or(0, |l| l.used_by(&credential.id).len());
     let title = if retry.rejected {
         format!("Sign-in failed for {name}")
     } else {
@@ -251,7 +250,7 @@ fn retry_card(s: &Bezel, retry: &Retry, k: &Kit) -> El {
             retry.to.name
         ),
     });
-    let label = credential.map_or("Password".to_owned(), |c| format!("Password for {}", c.username));
+    let label = format!("Password for {}", credential.username);
     let password = TextInput::new(&retry.password)
         .label(label.clone())
         .width(None)
@@ -498,38 +497,54 @@ pub fn credential_picker(
     label: &str,
     pick: fn(&mut Bezel, Option<CredentialId>),
 ) -> El {
-    let options: Vec<(String, String)> = std::iter::once((String::new(), none.to_owned()))
-        .chain(credentials.iter().map(|c| (c.id.to_string(), c.name.clone())))
+    let choices = std::iter::once((None, none.to_owned()))
+        .chain(credentials.iter().map(|c| (Some(c.id.clone()), c.name.clone())))
         .collect();
-    let selected = current.map(|id| id.to_string()).unwrap_or_default();
-    picker(k, key, label, options, selected, move |s: &mut Bezel, id: &str| {
-        pick(s, (!id.is_empty()).then(|| CredentialId::from(id)))
-    })
+    picker(k, key, "Credential", label, choices, &current.cloned(), pick)
 }
 
-/// The kit's select field as the face of a native pop-up menu of `(id, title)` options.
-pub fn picker(
+/// The kit's select field as the face of a native pop-up menu of `(value, title)` choices.
+/// `name` says what the choice is for; `label` shows the current one.
+pub fn picker<T: Clone + PartialEq + 'static>(
     k: &Kit,
     key: &'static str,
+    name: &str,
     label: &str,
-    options: Vec<(String, String)>,
-    selected: String,
-    pick: impl Fn(&mut Bezel, &str) + Clone + 'static,
+    choices: Vec<(T, String)>,
+    current: &T,
+    pick: fn(&mut Bezel, T),
 ) -> El {
+    let menu = picker_menu(&choices, current);
     Select::new(key, &[label])
+        .label(name)
         .current(Some(label))
         .appearance(SelectAppearance::Field)
         .fill()
         .on_toggle_tx(move |_: &mut Bezel, tx: &mut Tx| {
-            let menu = PopupMenu::picker(options.clone(), &selected);
-            let pick = pick.clone();
-            tx.popup_menu(menu, format!("{key}-trigger"), move |s: &mut Bezel, picked, _| {
-                if let Some(id) = picked {
-                    pick(s, id);
-                }
-            });
+            let choices = choices.clone();
+            tx.popup_menu(
+                menu.clone(),
+                format!("{key}-trigger"),
+                move |s: &mut Bezel, picked, _| {
+                    let choice = picked.and_then(|id| choices.get(id.parse::<usize>().ok()?));
+                    if let Some((value, _)) = choice {
+                        pick(s, value.clone());
+                    }
+                },
+            );
         })
         .build(k, &mut Vec::new())
+}
+
+/// Items are named by their place in `choices`: Rune refuses a menu with an empty or repeated
+/// item ID, and the values themselves may be empty (Ask each time, no Group).
+fn picker_menu<T: PartialEq>(choices: &[(T, String)], current: &T) -> PopupMenu {
+    let selected = choices.iter().position(|(value, _)| value == current).unwrap_or(0);
+    let items = choices
+        .iter()
+        .enumerate()
+        .map(|(i, (_, title))| (i.to_string(), title.clone()));
+    PopupMenu::picker(items, &selected.to_string())
 }
 
 pub fn buttons(secondary: El, primary: El) -> El {

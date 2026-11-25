@@ -86,17 +86,17 @@ fn connection(form: &ConnectionForm, snapshot: &Snapshot, k: &Kit, layer: &mut V
         .as_ref()
         .and_then(|id| snapshot.group(id))
         .map_or("None".to_owned(), |g| g.name.clone());
-    let groups = std::iter::once((String::new(), "None".to_owned()))
-        .chain(snapshot.groups.iter().map(|g| (g.id.to_string(), g.name.clone())))
+    let groups = std::iter::once((None, "None".to_owned()))
+        .chain(snapshot.groups.iter().map(|g| (Some(g.id.clone()), g.name.clone())))
         .collect();
-    let selected = form.group.as_ref().map(ToString::to_string).unwrap_or_default();
     let group = picker(
         k,
         "connection-group",
+        "Group",
         &group_name,
         groups,
-        selected,
-        |s: &mut Bezel, id: &str| s.set_form_group((!id.is_empty()).then(|| id.into())),
+        &form.group,
+        Bezel::set_form_group,
     );
     let mut body = col()
         .w_full()
@@ -125,7 +125,7 @@ fn connection(form: &ConnectionForm, snapshot: &Snapshot, k: &Kit, layer: &mut V
         .key("connection-save")
         .default_button(),
     ));
-    let title = match form.editing.as_ref().and_then(|id| snapshot.connection(id)) {
+    let title = match &form.editing {
         Some(connection) => format!("Edit {}", connection.name),
         None => "New connection".into(),
     };
@@ -205,7 +205,7 @@ fn credentials(sheet: &Credentials, snapshot: &Snapshot, k: &Kit, layer: &mut Ve
             || credential.username.to_lowercase().contains(&query);
         if matches {
             shown += 1;
-            let selected = sheet.selected == Selected::Existing(credential.id.clone());
+            let selected = matches!(&sheet.selected, Selected::Existing(c) if c.id == credential.id);
             rows = rows.child(credential_row(
                 credential,
                 snapshot.used_by(&credential.id).len(),
@@ -257,7 +257,7 @@ fn credentials(sheet: &Credentials, snapshot: &Snapshot, k: &Kit, layer: &mut Ve
             .center()
             .child(text("Select a credential").font(k.ty.ui).color(k.c.text_faint)),
         Selected::New(_) => credential_detail(sheet, None, snapshot, k),
-        Selected::Existing(id) => match snapshot.credential(id) {
+        Selected::Existing(selected) => match snapshot.credential(&selected.id) {
             Some(credential) => credential_detail(sheet, Some(credential), snapshot, k),
             None => col()
                 .grow(1.0)
@@ -446,7 +446,7 @@ fn certificates(snapshot: &Snapshot, k: &Kit, layer: &mut Vec<El>) {
         );
     }
     for certificate in &snapshot.trusted_certificates {
-        let (host, port) = (certificate.host.clone(), certificate.port);
+        let (host, port, sha256) = (certificate.host.clone(), certificate.port, certificate.sha256);
         list = list.child(
             col()
                 .key(format!("certificate-{host}:{port}"))
@@ -474,7 +474,7 @@ fn certificates(snapshot: &Snapshot, k: &Kit, layer: &mut Vec<El>) {
                             Button::new("Remove")
                                 .variant(ButtonVariant::Ghost)
                                 .control_size(ControlSize::Small)
-                                .on_press(move |s: &mut Bezel| s.forget_certificate(host.clone(), port))
+                                .on_press(move |s: &mut Bezel| s.forget_certificate(host.clone(), port, sha256))
                                 .build(k),
                         ),
                 )

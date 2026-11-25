@@ -70,7 +70,8 @@ pub const SCENES: &[Scene] = &[
     }),
     ("retry", |s| {
         s.library = Library::Ready(library());
-        s.screen = Screen::Retry(fixture_retry(Destination::connection(&dc01()), "c_admin".into()));
+        let admin = library().credentials[0].clone();
+        s.screen = Screen::Retry(fixture_retry(Destination::connection(&dc01()), admin));
     }),
     ("connecting", |s| {
         s.library = Library::Ready(library());

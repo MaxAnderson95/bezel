@@ -116,18 +116,19 @@ fn section_el(
 
 fn connection_row(s: &Bezel, snapshot: &Snapshot, id: &ConnectionId, name: &str, targets: &DropTargets, k: &Kit) -> El {
     let dot = s.dot(id);
-    let actions = row()
-        .key("actions")
-        .gap(2.0)
-        .group_opacity(0.0, 1.0)
-        // Session windows arrive with Tabs; until then this opens the Connection here.
-        .child(
-            hover_action(k, &icons::SQUARE_ARROW_TOP_RIGHT, "Open in new window", id, |s, id| {
-                s.open(id)
-            })
-            .key("open-window"),
-        )
-        .child(hover_action(k, &icons::PENCIL_LINE, "Edit", id, |s, id| s.edit_connection(id)).key("edit"));
+    let edit = id.clone();
+    // "Open in new window" joins Edit here when M3 adds Session windows.
+    let actions = row().key("actions").gap(2.0).group_opacity(0.0, 1.0).child(
+        IconButton::new(&icons::PENCIL_LINE)
+            .variant(IconButtonVariant::GhostMuted)
+            .control_size(ControlSize::Small)
+            .label("Edit")
+            .on_press(move |s: &mut Bezel| s.edit_connection(&edit))
+            .build(k)
+            .key("edit")
+            // Pointer only, as the kit's row close button: the list's arrows step through rows.
+            .focusable(false),
+    );
     let mut sidebar_row = SidebarRow::new(name)
         .icon(&icons::MONITOR)
         .selected(dot.is_some())
@@ -148,7 +149,12 @@ fn connection_row(s: &Bezel, snapshot: &Snapshot, id: &ConnectionId, name: &str,
         .build(k)
         .key(id.to_string())
         .on_secondary_press(move |_: &mut Bezel, press: PointerPress, tx: &mut Tx| {
-            connection_menu(menu.clone(), &groups, current.as_ref(), press, tx)
+            let (id, groups) = (menu.clone(), groups.clone());
+            tx.popup_menu(
+                connection_menu(&groups, current.as_ref()),
+                press,
+                move |s: &mut Bezel, picked, _| on_connection_menu(s, id, &groups, picked),
+            );
         })
         .on_drag(move |s: &mut Bezel, d: &mut Drag, tx: &mut Tx| {
             s.drag(Dragged::Connection(drag.clone()), d, &targets, tx)
@@ -161,58 +167,41 @@ fn connection_row(s: &Bezel, snapshot: &Snapshot, id: &ConnectionId, name: &str,
     }
 }
 
-fn hover_action(
-    k: &Kit,
-    glyph: &'static rune::Icon,
-    label: &str,
-    id: &ConnectionId,
-    act: fn(&mut Bezel, &ConnectionId),
-) -> El {
-    let id = id.clone();
-    IconButton::new(glyph)
-        .variant(IconButtonVariant::GhostMuted)
-        .control_size(ControlSize::Small)
-        .label(label)
-        .on_press(move |s: &mut Bezel| act(s, &id))
-        .build(k)
-        // Pointer only, as the kit's row close button: the list's arrows step through rows.
-        .focusable(false)
-}
-
-fn connection_menu(
-    id: ConnectionId,
-    groups: &[(GroupId, String)],
-    current: Option<&GroupId>,
-    press: PointerPress,
-    tx: &mut Tx,
-) {
-    let move_to = groups.iter().fold(
-        PopupMenu::new().item(PopupItem::new("move:", "Ungrouped").checked(current.is_none())),
-        |menu, (group, name)| {
-            menu.item(PopupItem::new(format!("move:{group}"), name.clone()).checked(current == Some(group)))
+/// A Connection's context menu. Items for Groups are named by their place in `groups`.
+fn connection_menu(groups: &[(GroupId, String)], current: Option<&GroupId>) -> PopupMenu {
+    let move_to = groups.iter().enumerate().fold(
+        PopupMenu::new().item(PopupItem::new("ungroup", "Ungrouped").checked(current.is_none())),
+        |menu, (i, (group, name))| {
+            menu.item(PopupItem::new(format!("move-{i}"), name.clone()).checked(current == Some(group)))
         },
     );
-    let menu = PopupMenu::new()
+    // "Open in new window" joins Open when M3 adds Session windows.
+    PopupMenu::new()
         .item(PopupItem::new("open", "Open"))
-        .item(PopupItem::new("open-window", "Open in new window"))
         .item(PopupItem::new("edit", "Edit…"))
         .item(PopupItem::new("duplicate", "Duplicate"))
         .submenu("Move to group", move_to)
         .separator()
-        .item(PopupItem::new("delete", "Delete…"));
-    tx.popup_menu(menu, press, move |s: &mut Bezel, picked, _| match picked {
-        // Session windows arrive with Tabs; until then a new window opens it here.
-        Some("open" | "open-window") => s.open(&id),
+        .item(PopupItem::new("delete", "Delete…"))
+}
+
+fn on_connection_menu(s: &mut Bezel, id: ConnectionId, groups: &[(GroupId, String)], picked: Option<&str>) {
+    match picked {
+        Some("open") => s.open(&id),
         Some("edit") => s.edit_connection(&id),
         Some("duplicate") => s.duplicate_connection(&id),
         Some("delete") => s.ask_delete(Delete::Connection(id)),
+        Some("ungroup") => s.move_connection(id, None),
         Some(other) => {
-            if let Some(group) = other.strip_prefix("move:") {
-                s.move_connection(id, (!group.is_empty()).then(|| GroupId::from(group)));
+            let group = other
+                .strip_prefix("move-")
+                .and_then(|i| groups.get(i.parse::<usize>().ok()?));
+            if let Some((group, _)) = group {
+                s.move_connection(id, Some(group.clone()));
             }
         }
         None => {}
-    });
+    }
 }
 
 fn group_menu(id: GroupId, index: usize, count: usize, press: PointerPress, tx: &mut Tx) {
