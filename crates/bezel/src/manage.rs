@@ -37,8 +37,8 @@ impl ConnectionForm {
 }
 
 pub struct GroupForm {
-    /// `None` for a new Group.
-    pub renaming: Option<GroupId>,
+    /// The Group as it was when the sheet opened; `None` for a new one.
+    pub renaming: Option<Group>,
     pub name: TextEdit,
 }
 
@@ -114,10 +114,21 @@ pub fn host_text(connection: &Connection) -> String {
     }
 }
 
-/// Takes `now` into a field still showing `before`.
-fn rebase(field: &mut TextEdit, before: &str, now: &str) {
-    if field.text.trim() == before {
+/// A form field follows the Library: when the saved value moved from `baseline`, the value the
+/// form was opened from, the field shows the saved one. A field the person changed keeps their
+/// value until the Library holds something else for it, either because their save committed it
+/// or because it was changed elsewhere (which refused their save).
+fn follow<T: Clone + PartialEq>(field: &mut T, baseline: &T, now: &T) {
+    if baseline != now {
+        *field = now.clone();
+    }
+}
+
+fn follow_text(field: &mut TextEdit, baseline: &str, now: &str) {
+    if baseline != now {
+        let focused = field.focused;
         *field = TextEdit::new(now);
+        field.focused = focused;
     }
 }
 
@@ -246,7 +257,7 @@ impl Bezel {
             return;
         };
         self.sheet = Some(Sheet::Group(GroupForm {
-            renaming: Some(group.id.clone()),
+            renaming: Some(group.clone()),
             name: focused(group.name.clone()),
         }));
     }
@@ -259,7 +270,8 @@ impl Bezel {
         }
         let change = match &form.renaming {
             Some(group) => Change::RenameGroup {
-                group: group.clone(),
+                group: group.id.clone(),
+                from: group.name.clone(),
                 name,
             },
             None => Change::AddGroup(Group {
@@ -443,7 +455,53 @@ impl Bezel {
         self.apply(Change::ForgetCertificate { host, port, sha256 });
     }
 
-    /// Takes the reply to a sheet's save. False when no sheet was waiting for it.
+    /// Brings every open form up to the Library after any reply from it. Each form keeps the
+    /// item as it was opened (its baseline); fields follow the Library where it moved from the
+    /// baseline (see `follow`), and a password typed for one account is cleared when the
+    /// Credential's username changes, so it never reaches another account.
+    pub(crate) fn follow_library(&mut self) {
+        self.follow_retry();
+        let Some(snapshot) = self.library.ready() else { return };
+        match &mut self.sheet {
+            Some(Sheet::Connection(form)) => {
+                let Some(baseline) = &form.editing else { return };
+                let Some(now) = snapshot.connection(&baseline.id) else {
+                    return;
+                };
+                follow_text(&mut form.name, &baseline.name, &now.name);
+                follow_text(&mut form.host, &host_text(baseline), &host_text(now));
+                follow(&mut form.credential, &baseline.credential, &now.credential);
+                follow(&mut form.group, &baseline.group, &now.group);
+                form.editing = Some(now.clone());
+            }
+            Some(Sheet::Group(form)) => {
+                let Some(baseline) = &form.renaming else { return };
+                let Some(now) = snapshot.group(&baseline.id) else {
+                    return;
+                };
+                follow_text(&mut form.name, &baseline.name, &now.name);
+                form.renaming = Some(now.clone());
+            }
+            Some(Sheet::Credentials(sheet)) => {
+                let Selected::Existing(baseline) = &sheet.selected else {
+                    return;
+                };
+                let Some(now) = snapshot.credential(&baseline.id) else {
+                    return;
+                };
+                follow_text(&mut sheet.name, &baseline.name, &now.name);
+                follow_text(&mut sheet.username, &baseline.username, &now.username);
+                if baseline.username != now.username {
+                    sheet.password = TextEdit::default().secure();
+                }
+                sheet.selected = Selected::Existing(now.clone());
+            }
+            Some(Sheet::Certificates) | None => {}
+        }
+    }
+
+    /// Takes the reply to a sheet's save, after `follow_library`. False when no sheet was
+    /// waiting for it.
     pub(crate) fn on_sheet_saved(&mut self, id: RequestId, error: Option<&str>) -> bool {
         match &mut self.sheet {
             Some(Sheet::Connection(form)) if form.saving == Some(id) => {
@@ -455,31 +513,20 @@ impl Bezel {
             }
             Some(Sheet::Credentials(sheet)) if sheet.saving == Some(id) => {
                 sheet.saving = None;
-                let selected = match &sheet.selected {
-                    Selected::Existing(credential) => &credential.id,
-                    Selected::New(id) => id,
-                    Selected::Nothing => return true,
-                };
-                let Some(now) = self.library.ready().and_then(|s| s.credential(selected)) else {
-                    sheet.error = error.map(Into::into);
-                    return true;
-                };
-                match error {
-                    None => {
-                        sheet.password.clear();
-                        sheet.error = None;
-                    }
-                    // What the person didn't change follows the Credential as it is now, so
-                    // saving again doesn't put back what another Bezel changed meanwhile.
-                    Some(e) => {
-                        if let Selected::Existing(original) = &sheet.selected {
-                            rebase(&mut sheet.name, &original.name, &now.name);
-                            rebase(&mut sheet.username, &original.username, &now.username);
+                sheet.error = error.map(Into::into);
+                match (&sheet.selected, error) {
+                    (Selected::Existing(_), None) => sheet.password.clear(),
+                    (Selected::New(id), None) => {
+                        if let Some(now) = self.library.ready().and_then(|s| s.credential(id)) {
+                            sheet.selected = Selected::Existing(now.clone());
+                            sheet.password.clear();
                         }
-                        sheet.error = Some(e.into());
                     }
+                    // Refused, perhaps because its ID was taken: the next try is a new
+                    // Credential with an ID of its own.
+                    (Selected::New(_), Some(_)) => sheet.selected = Selected::New(CredentialId::random()),
+                    (Selected::Existing(_) | Selected::Nothing, Some(_)) | (Selected::Nothing, None) => {}
                 }
-                sheet.selected = Selected::Existing(now.clone());
             }
             _ => return false,
         }

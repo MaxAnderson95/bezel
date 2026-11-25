@@ -145,17 +145,22 @@ pub struct Retry {
     pub credential: Credential,
     /// Assign the Credential to the Connection once signed in (see `Signing::assign`).
     assign: bool,
+    /// The Credential was saved from the sign-in sheet for the rejected sign-in, and this is
+    /// that save, still in flight: the prompt waits for it, and falls back to the sign-in
+    /// sheet if it is refused.
+    adding: Option<RequestId>,
     /// The server rejected the password; otherwise the Keychain had none.
     pub rejected: bool,
     pub password: TextEdit,
     pub error: Option<String>,
-    /// The save of the new password, and the password to retry with once it is saved.
-    saving: Option<(RequestId, Secret)>,
+    /// The save of the new password, with the password and the Credential it was typed for,
+    /// to sign in with once it is saved.
+    saving: Option<(RequestId, Secret, Credential)>,
 }
 
 impl Retry {
     pub fn saving(&self) -> bool {
-        self.saving.is_some()
+        self.saving.is_some() || self.adding.is_some()
     }
 }
 
@@ -323,8 +328,9 @@ impl Bezel {
 
     fn on_saved(&mut self, id: RequestId, snapshot: Snapshot, error: Option<String>) {
         // A refused change can still bring news from disk, such as a certificate another
-        // Bezel remembered, which the next Session must expect.
+        // Bezel remembered, which the next Session must expect, and every open form follows it.
         self.library = Library::Ready(snapshot);
+        self.follow_library();
         if let Screen::Session(live) = &mut self.screen
             && live.trust == Trust::Remembering(id)
         {
@@ -344,21 +350,35 @@ impl Bezel {
             && signing.adding == Some(id)
         {
             signing.adding = None;
-            if let Some(e) = error {
-                // Without its Credential the Session's password is a one-off again.
-                live.signing = None;
-                self.notice = Some(format!("The credential was not saved. {e}"));
+            match error {
+                None => self.assign_when_signed_in(),
+                Some(e) => {
+                    // Without its Credential the Session's password is a one-off again.
+                    live.signing = None;
+                    self.notice = Some(format!("The credential was not saved. {e}"));
+                }
             }
             return;
         }
         if let Screen::Retry(retry) = &mut self.screen
-            && retry.saving.as_ref().is_some_and(|(saving, _)| *saving == id)
+            && retry.adding == Some(id)
         {
-            let (_, password) = retry.saving.take().expect("matched above");
+            retry.adding = None;
+            if let Some(e) = error {
+                let error = Some(format!("The credential was not saved, so sign in again. {e}"));
+                let (to, username) = (retry.to.clone(), retry.credential.username.clone());
+                self.screen = Screen::SignIn(SignIn::new(to, username, error));
+            }
+            return;
+        }
+        if let Screen::Retry(retry) = &mut self.screen
+            && retry.saving.as_ref().is_some_and(|(saving, ..)| *saving == id)
+        {
+            let (_, password, credential) = retry.saving.take().expect("matched above");
             match error {
                 None => {
-                    let (to, credential, assign) = (retry.to.clone(), retry.credential.id.clone(), retry.assign);
-                    self.connect_with(to, &credential, password, assign);
+                    let (to, assign) = (retry.to.clone(), retry.assign);
+                    self.connect_as(to, credential, password, assign);
                 }
                 Some(e) => retry.error = Some(e),
             }
@@ -379,16 +399,49 @@ impl Bezel {
         if unlocking.request != id {
             return;
         }
-        let (to, credential) = (unlocking.to.clone(), unlocking.credential.clone());
+        let to = unlocking.to.clone();
+        let Some(credential) = self
+            .library
+            .ready()
+            .and_then(|s| s.credential(&unlocking.credential))
+            .cloned()
+        else {
+            self.screen = Screen::SignIn(SignIn::new(to, self.last_username.clone(), Some(DELETED.into())));
+            return;
+        };
         let error = match password {
-            Ok(Some(password)) => return self.connect_with(to, &credential, password, false),
+            Ok(Some(password)) => return self.connect_as(to, credential, password, false),
             Ok(None) => None,
             Err(e) => Some(format!("Bezel couldn't read the password from the Keychain. {e}")),
         };
-        self.screen = match self.library.ready().and_then(|s| s.credential(&credential)) {
-            Some(credential) => Screen::Retry(retry(to, credential.clone(), false, false, error)),
-            None => Screen::SignIn(SignIn::new(to, self.last_username.clone(), Some(DELETED.into()))),
+        self.screen = Screen::Retry(retry(to, credential, false, false, error));
+    }
+
+    /// Keeps the wrong-password prompt bound to the account it asks about: when the
+    /// Credential's username changes, the password typed for the old one is cleared, and when
+    /// the Credential is gone the sign-in sheet takes over.
+    pub(crate) fn follow_retry(&mut self) {
+        let (Screen::Retry(retry), Some(snapshot)) = (&mut self.screen, self.library.ready()) else {
+            return;
         };
+        match snapshot.credential(&retry.credential.id) {
+            Some(now) => {
+                if now.username != retry.credential.username {
+                    retry.password = TextEdit::default().secure();
+                    retry.password.focused = true;
+                    retry.error = Some(format!(
+                        "The username of {} changed to {}. Enter the password for {}.",
+                        now.name, now.username, now.username
+                    ));
+                }
+                retry.credential = now.clone();
+            }
+            None if retry.adding.is_none() && retry.saving.is_none() => {
+                let to = retry.to.clone();
+                self.screen = Screen::SignIn(SignIn::new(to, self.last_username.clone(), Some(DELETED.into())));
+            }
+            None => {}
+        }
     }
 
     /// Next ID for a store request.
@@ -481,12 +534,8 @@ impl Bezel {
         });
     }
 
-    /// Connects with a saved Credential's password, its username read from the Library now.
-    fn connect_with(&mut self, to: Destination, credential: &CredentialId, password: Secret, assign: bool) {
-        let Some(credential) = self.library.ready().and_then(|s| s.credential(credential)).cloned() else {
-            self.screen = Screen::SignIn(SignIn::new(to, self.last_username.clone(), Some(DELETED.into())));
-            return;
-        };
+    /// Connects with a saved Credential's password, as the account it was read or typed for.
+    fn connect_as(&mut self, to: Destination, credential: Credential, password: Secret, assign: bool) {
         match Username::parse(&credential.username) {
             Ok(username) => self.connect(Connect {
                 to,
@@ -505,16 +554,27 @@ impl Bezel {
         }
     }
 
-    /// Makes the Connection sign in with the Credential from now on.
-    fn assign(&mut self, connection: &ConnectionId, credential: CredentialId) {
-        let Some(original) = self.library.ready().and_then(|s| s.connection(connection)).cloned() else {
+    /// Once a Session that saved its Credential from the sign-in sheet is signed in and the
+    /// Credential is saved, makes the Connection it signed in to use it from now on, if that
+    /// Connection still asks each time and reaches the same endpoint.
+    fn assign_when_signed_in(&mut self) {
+        let Screen::Session(live) = &mut self.screen else {
             return;
         };
-        let edited = Connection {
-            credential: Some(credential),
-            ..original.clone()
+        let (Some(signing), Some(connection)) = (&mut live.signing, &live.to.connection) else {
+            return;
         };
-        self.apply(Change::EditConnection { original, edited });
+        if !signing.assign || signing.adding.is_some() || !matches!(live.state, Phase::Connected { .. }) {
+            return;
+        }
+        signing.assign = false;
+        let change = Change::AssignCredential {
+            connection: connection.clone(),
+            credential: signing.credential.id.clone(),
+            host: live.to.address.host.clone(),
+            port: live.to.address.port,
+        };
+        self.apply(change);
     }
 
     pub fn cancel_sign_in(&mut self) {
@@ -662,13 +722,7 @@ impl Bezel {
             Event::State(State::Connecting) => live.state = Phase::Connecting,
             Event::State(State::Connected { width, height }) => {
                 live.state = Phase::Connected { width, height };
-                if let (Some(signing), Some(connection)) = (&mut live.signing, &live.to.connection)
-                    && signing.assign
-                {
-                    signing.assign = false;
-                    let (connection, credential) = (connection.clone(), signing.credential.id.clone());
-                    self.assign(&connection, credential);
-                }
+                self.assign_when_signed_in();
             }
             Event::State(State::Reconnecting) => live.state = Phase::Reconnecting,
             Event::State(State::Disconnected(ended)) => {
@@ -690,7 +744,9 @@ impl Bezel {
                 let to = live.to.clone();
                 self.screen = match live.signing.clone() {
                     Some(signing) if wrong_password => {
-                        Screen::Retry(retry(to, signing.credential, signing.assign, true, None))
+                        let mut retry = retry(to, signing.credential, signing.assign, true, None);
+                        retry.adding = signing.adding;
+                        Screen::Retry(retry)
                     }
                     Some(_) => {
                         self.ended = Some(ended);
@@ -708,7 +764,7 @@ impl Bezel {
         let Screen::Retry(retry) = &mut self.screen else {
             return;
         };
-        if retry.saving.is_some() || retry.password.text.is_empty() {
+        if retry.saving() || retry.password.text.is_empty() {
             return;
         }
         let password = Secret::from(retry.password.text.clone());
@@ -723,7 +779,7 @@ impl Bezel {
         if let Some(id) = self.apply(change)
             && let Screen::Retry(retry) = &mut self.screen
         {
-            retry.saving = Some((id, password));
+            retry.saving = Some((id, password, retry.credential.clone()));
         }
     }
 
@@ -885,6 +941,7 @@ fn retry(to: Destination, credential: Credential, assign: bool, rejected: bool, 
         to,
         credential,
         assign,
+        adding: None,
         rejected,
         password,
         error,
@@ -931,7 +988,7 @@ mod tests {
     use rune::{Env, Runtime};
 
     use super::*;
-    use crate::manage::Delete;
+    use crate::manage::{Delete, Selected};
 
     /// A Bezel whose Library is a file in a temporary folder, holding the Groups Infrastructure
     /// and File servers, the Credential Domain admin (password "old") used by dc01, and the
@@ -1141,8 +1198,18 @@ mod tests {
         sign_in.password = TextEdit::new(password);
         sign_in.save_name = TextEdit::new("Local admin");
         bezel.sign_in();
-        wait_until(bezel, |b| snapshot(b).credentials.len() == 2);
-        snapshot(bezel).credentials[1].clone()
+        let Screen::Session(live) = &bezel.screen else { panic!() };
+        live.signing.as_ref().unwrap().credential.clone()
+    }
+
+    /// The Library file, for changes "another Bezel" makes.
+    fn library_file(alive: &(tempfile::TempDir, std::net::TcpListener)) -> std::path::PathBuf {
+        alive.0.path().join("bezel.toml")
+    }
+
+    /// Makes every save fail by putting a folder where the Library writes its temporary file.
+    fn block_saves(alive: &(tempfile::TempDir, std::net::TcpListener)) {
+        std::fs::create_dir(alive.0.path().join(format!("bezel.toml.{}.tmp", std::process::id()))).unwrap();
     }
 
     #[test]
@@ -1153,6 +1220,7 @@ mod tests {
             _alive,
         } = fixture();
         let saved = sign_in_saving(&mut bezel, "typed");
+        wait_until(&mut bezel, |b| snapshot(b).credentials.len() == 2);
         assert_eq!(
             (saved.name.as_str(), saved.username.as_str()),
             ("Local admin", "administrator")
@@ -1174,12 +1242,16 @@ mod tests {
             _alive,
         } = fixture();
         let saved = sign_in_saving(&mut bezel, "typo");
+        // The server answers before the Keychain has stored the new Credential's password.
         session_event(&mut bezel, rejected());
         let Screen::Retry(retry) = &mut bezel.screen else {
             panic!("expected the wrong-password prompt for the new Credential");
         };
         assert_eq!(retry.credential.id, saved.id);
+        assert!(retry.saving(), "the prompt waits for the Credential to be saved");
         retry.password = TextEdit::new("right");
+        bezel.retry();
+        wait_until(&mut bezel, |b| matches!(&b.screen, Screen::Retry(r) if !r.saving()));
         bezel.retry();
         let sessions = bezel.next_session;
         wait_until(&mut bezel, |b| b.next_session > sessions);
@@ -1188,6 +1260,179 @@ mod tests {
         wait_until(&mut bezel, |b| {
             snapshot(b).connection(&"n_lab".into()).unwrap().credential == Some(saved.id.clone())
         });
+    }
+
+    #[test]
+    fn a_credential_refused_after_its_sign_in_was_rejected_falls_back_to_typing() {
+        let Fixture { mut bezel, _alive, .. } = fixture();
+        block_saves(&_alive);
+        sign_in_saving(&mut bezel, "typo");
+        session_event(&mut bezel, rejected());
+        assert!(matches!(bezel.screen, Screen::Retry(_)));
+        wait_until(&mut bezel, |b| matches!(b.screen, Screen::SignIn(_)));
+        let Screen::SignIn(sign_in) = &bezel.screen else {
+            panic!()
+        };
+        assert_eq!(sign_in.username.text, "administrator");
+        assert!(sign_in.error.as_deref().is_some_and(|e| e.contains("not saved")));
+        assert_eq!(snapshot(&bezel).credentials.len(), 1);
+    }
+
+    #[test]
+    fn the_credentials_sheet_follows_the_library_and_keeps_passwords_to_their_account() {
+        let Fixture {
+            mut bezel,
+            secrets,
+            _alive,
+        } = fixture();
+        let mut other = Store_::open(library_file(&_alive), secrets.clone()).unwrap();
+        let admin = snapshot(&bezel).credential(&"c_admin".into()).unwrap().clone();
+        let rename_user = |from: &Credential, to: &str| Change::EditCredential {
+            original: from.clone(),
+            edited: Credential {
+                username: to.into(),
+                ..from.clone()
+            },
+            password: None,
+            today: today(),
+        };
+        let sheet = |b: &Bezel| match &b.sheet {
+            Some(Sheet::Credentials(sheet)) => (
+                sheet.name.text.clone(),
+                sheet.username.text.clone(),
+                sheet.password.text.clone(),
+                sheet.saving(),
+                sheet.error.clone(),
+            ),
+            _ => panic!(),
+        };
+        bezel.open_credentials(None);
+        other.apply(rename_user(&admin, r"CORP\bob")).unwrap();
+        // Saving only a new name keeps Bob, and the form shows Bob from then on.
+        if let Some(Sheet::Credentials(sheet)) = &mut bezel.sheet {
+            sheet.name = TextEdit::new("Admin");
+        }
+        bezel.save_credential();
+        wait_until(&mut bezel, |b| !sheet(b).3);
+        assert_eq!(
+            sheet(&bezel),
+            ("Admin".into(), r"CORP\bob".into(), String::new(), false, None)
+        );
+        // A password typed for Bob is refused once the account became Carol, and cleared.
+        let bob = snapshot(&bezel).credential(&"c_admin".into()).unwrap().clone();
+        other.apply(rename_user(&bob, r"CORP\carol")).unwrap();
+        if let Some(Sheet::Credentials(sheet)) = &mut bezel.sheet {
+            sheet.password = TextEdit::new("bobs");
+        }
+        bezel.save_credential();
+        wait_until(&mut bezel, |b| !sheet(b).3);
+        let (_, username, password, _, error) = sheet(&bezel);
+        assert_eq!((username.as_str(), password.as_str()), (r"CORP\carol", ""));
+        assert!(error.is_some());
+        assert_eq!(secrets.get(&"c_admin".into()), Some(Secret::from("old".to_owned())));
+    }
+
+    #[test]
+    fn the_connection_sheet_shows_a_host_changed_elsewhere_instead_of_overwriting_it() {
+        let Fixture { mut bezel, _alive, .. } = fixture();
+        let mut other = Store_::open(library_file(&_alive), MemorySecrets::default()).unwrap();
+        let dc01 = snapshot(&bezel).connection(&"n_dc01".into()).unwrap().clone();
+        bezel.edit_connection(&dc01.id);
+        other
+            .apply(Change::EditConnection {
+                original: dc01.clone(),
+                edited: Connection {
+                    host: "dc01-b.corp.lan".into(),
+                    ..dc01.clone()
+                },
+            })
+            .unwrap();
+        if let Some(Sheet::Connection(form)) = &mut bezel.sheet {
+            form.host = TextEdit::new(format!("dc01-c.corp.lan:{}", dc01.port));
+            form.name = TextEdit::new("primary");
+        }
+        bezel.save_connection();
+        wait_until(
+            &mut bezel,
+            |b| matches!(&b.sheet, Some(Sheet::Connection(f)) if f.error.is_some()),
+        );
+        let Some(Sheet::Connection(form)) = &bezel.sheet else {
+            panic!()
+        };
+        let shown = format!("dc01-b.corp.lan:{}", dc01.port);
+        assert_eq!(
+            (form.host.text.as_str(), form.name.text.as_str()),
+            (shown.as_str(), "primary")
+        );
+        bezel.save_connection();
+        wait_until(&mut bezel, |b| b.sheet.is_none());
+        let saved = snapshot(&bezel).connection(&dc01.id).unwrap();
+        assert_eq!(
+            (saved.host.as_str(), saved.name.as_str()),
+            ("dc01-b.corp.lan", "primary")
+        );
+    }
+
+    #[test]
+    fn the_wrong_password_prompt_follows_its_credentials_account() {
+        let Fixture {
+            mut bezel,
+            secrets,
+            _alive,
+        } = fixture();
+        let mut other = Store_::open(library_file(&_alive), secrets.clone()).unwrap();
+        bezel.screen = Screen::Session(dc01_session(&bezel, Some("c_admin")));
+        bezel.on_session(7, rejected());
+        let Screen::Retry(retry) = &mut bezel.screen else {
+            panic!()
+        };
+        retry.password = TextEdit::new("alices");
+        let admin = retry.credential.clone();
+        other
+            .apply(Change::EditCredential {
+                original: admin.clone(),
+                edited: Credential {
+                    username: r"CORP\bob".into(),
+                    ..admin
+                },
+                password: None,
+                today: today(),
+            })
+            .unwrap();
+        bezel.retry();
+        wait_until(&mut bezel, |b| matches!(&b.screen, Screen::Retry(r) if !r.saving()));
+        let Screen::Retry(retry) = &bezel.screen else { panic!() };
+        assert_eq!(retry.credential.username, r"CORP\bob");
+        assert!(retry.password.text.is_empty() && retry.error.is_some());
+        assert_eq!(secrets.get(&"c_admin".into()), Some(Secret::from("old".to_owned())));
+    }
+
+    #[test]
+    fn a_new_credential_refused_for_its_id_stays_new() {
+        let Fixture {
+            mut bezel,
+            secrets,
+            _alive,
+        } = fixture();
+        bezel.open_credentials(None);
+        bezel.new_credential();
+        if let Some(Sheet::Credentials(sheet)) = &mut bezel.sheet {
+            sheet.selected = Selected::New("c_admin".into());
+            sheet.name = TextEdit::new("Lab");
+            sheet.username = TextEdit::new("labadmin");
+            sheet.password = TextEdit::new("lab");
+        }
+        bezel.save_credential();
+        wait_until(
+            &mut bezel,
+            |b| matches!(&b.sheet, Some(Sheet::Credentials(s)) if !s.saving()),
+        );
+        let Some(Sheet::Credentials(sheet)) = &bezel.sheet else {
+            panic!()
+        };
+        assert!(matches!(&sheet.selected, Selected::New(id) if id.as_str() != "c_admin"));
+        assert_eq!(sheet.name.text, "Lab");
+        assert_eq!(secrets.get(&"c_admin".into()), Some(Secret::from("old".to_owned())));
     }
 
     /// Rune refuses to show a menu with an empty or repeated item ID.
