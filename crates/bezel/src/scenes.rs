@@ -8,20 +8,26 @@ use bezel_rdp::{CertificateRequest, Ended};
 use rune::TextEdit;
 use time::macros::date;
 
-use crate::app::{Bezel, Destination, Library, Phase, Screen, fixture_retry, fixture_session};
+use crate::app::{
+    Bezel, Destination, Library, Opening, Phase, Screen, Session, fixture_retry, fixture_session, fixture_sign_in,
+};
 use crate::manage::Delete;
+use crate::windows::Window;
 
 type Scene = (&'static str, fn(&mut Bezel));
 
 pub const SCENES: &[Scene] = &[
     ("error", |s| {
         s.library = Library::Ready(library());
-        s.host = TextEdit::new("dc01.corp.lan");
-        s.ended = Some(Ended {
+        let ended = Ended {
             message: "dc01.corp.lan refused the connection on port 3389".into(),
             details: "connection refused".into(),
             by_user: false,
-        });
+        };
+        tab(
+            s,
+            session(1, Destination::new_host(address("dc01.corp.lan")), Screen::Ended(ended)),
+        );
     }),
     ("first-run", |s| s.library = Library::Ready(Snapshot::default())),
     ("library-error", |s| {
@@ -29,25 +35,55 @@ pub const SCENES: &[Scene] = &[
             "~/Library/Application Support/Bezel/bezel.toml has an error on line 12: invalid type: string \"rdp\", expected u16".into(),
         )
     }),
+    ("connect-box", |s| {
+        s.library = Library::Ready(library());
+        s.here.palette.query = TextEdit::new("dc");
+    }),
     ("sidebar", |s| {
         s.library = Library::Ready(library());
-        s.screen = Screen::Session(fixture_session(
-            Destination::connection(&dc01()),
-            Phase::Connected {
-                width: 2048,
-                height: 1280,
-            },
-            None,
-        ));
+        tab(s, connected(1, &dc01()));
     }),
     ("sidebar-hidden", |s| {
         s.library = Library::Ready(library());
         s.sidebar = false;
     }),
+    ("tabs", |s| {
+        s.library = Library::Ready(library());
+        tabs(s);
+    }),
+    ("palette", |s| {
+        s.library = Library::Ready(library());
+        tabs(s);
+        s.here.palette.open = true;
+        s.here.palette.query = TextEdit::new("dc");
+        s.here.palette.selected = 1;
+    }),
+    ("palette-new-host", |s| {
+        s.library = Library::Ready(library());
+        tabs(s);
+        s.here.palette.open = true;
+        s.here.palette.query = TextEdit::new("10.0.0.5:3390");
+    }),
+    ("session-window", |s| {
+        s.library = Library::Ready(library());
+        tabs(s);
+        s.open_window(2, None);
+        s.here.window = Window::Session(2);
+    }),
+    ("session-window-sign-in", |s| {
+        s.library = Library::Ready(library());
+        let id = s.open_host(address("10.0.0.5"), Opening::Window);
+        s.here.window = Window::Session(id);
+    }),
+    ("quit", |s| {
+        s.library = Library::Ready(library());
+        tabs(s);
+        s.quitting = true;
+    }),
     ("sign-in", |s| {
         s.library = Library::Ready(library());
-        s.open(&"n_lab".into());
-        if let Screen::SignIn(sign_in) = &mut s.screen {
+        s.open(&"n_lab".into(), Opening::Tab, false);
+        if let Some(Screen::SignIn(sign_in)) = s.sessions.last_mut().map(|x| &mut x.screen) {
             sign_in.username = TextEdit::new(r"CORP\admin.max");
             sign_in.password = TextEdit::new("hunter2").secure();
             sign_in.error = Some("The username or password is incorrect".into());
@@ -55,36 +91,39 @@ pub const SCENES: &[Scene] = &[
     }),
     ("sign-in-save", |s| {
         s.library = Library::Ready(library());
-        s.host = TextEdit::new("10.0.0.5");
-        s.submit_host();
-        if let Screen::SignIn(sign_in) = &mut s.screen {
+        let id = s.open_host(address("10.0.0.5"), Opening::Tab);
+        if let Some(Screen::SignIn(sign_in)) = s.sessions.last_mut().map(|x| &mut x.screen) {
             sign_in.username = TextEdit::new("administrator");
             sign_in.password = TextEdit::new("hunter2").secure();
         }
-        s.toggle_save_credential();
+        s.toggle_save_credential(id);
     }),
     ("sign-in-saved", |s| {
         s.library = Library::Ready(library());
-        s.open(&"n_lab".into());
-        s.sign_in_with(Some("c_admin".into()));
+        s.open(&"n_lab".into(), Opening::Tab, false);
+        if let Some(id) = s.active {
+            s.sign_in_with(id, Some("c_admin".into()));
+        }
     }),
     ("retry", |s| {
         s.library = Library::Ready(library());
         let admin = library().credentials[0].clone();
-        s.screen = Screen::Retry(fixture_retry(Destination::connection(&dc01()), admin));
+        tab(s, session(1, Destination::connection(&dc01()), fixture_retry(admin)));
     }),
     ("connecting", |s| {
         s.library = Library::Ready(library());
-        s.screen = Screen::Session(fixture_session(Destination::new_host(fs01()), Phase::Connecting, None))
+        tab(
+            s,
+            fixture_session(1, Destination::new_host(fs01()), Phase::Connecting, None),
+        );
     }),
     ("certificate", |s| {
         s.library = Library::Ready(library());
         let request = CertificateRequest::detached("fs01.corp.lan", 3389, Question::FirstUse(certificate()));
-        s.screen = Screen::Session(fixture_session(
-            Destination::new_host(fs01()),
-            Phase::Connecting,
-            Some(request),
-        ));
+        tab(
+            s,
+            fixture_session(1, Destination::new_host(fs01()), Phase::Connecting, Some(request)),
+        );
     }),
     ("certificate-changed", |s| {
         s.library = Library::Ready(library());
@@ -93,11 +132,10 @@ pub const SCENES: &[Scene] = &[
             presented: certificate(),
         };
         let request = CertificateRequest::detached("fs01.corp.lan", 3389, question);
-        s.screen = Screen::Session(fixture_session(
-            Destination::new_host(fs01()),
-            Phase::Connecting,
-            Some(request),
-        ));
+        tab(
+            s,
+            fixture_session(1, Destination::new_host(fs01()), Phase::Connecting, Some(request)),
+        );
     }),
     ("new-connection", |s| {
         s.library = Library::Ready(library());
@@ -139,11 +177,61 @@ pub const SCENES: &[Scene] = &[
     }),
 ];
 
-fn fs01() -> Address {
-    Address {
-        host: "fs01.corp.lan".into(),
-        port: 3389,
+fn session(id: u64, to: Destination, screen: Screen) -> Session {
+    Session {
+        screen,
+        ..fixture_session(id, to, Phase::Connecting, None)
     }
+}
+
+fn connected(id: u64, connection: &Connection) -> Session {
+    fixture_session(
+        id,
+        Destination::connection(connection),
+        Phase::Connected {
+            width: 2048,
+            height: 1280,
+        },
+        None,
+    )
+}
+
+/// Adds the Session as a Tab and makes it the current one.
+fn tab(s: &mut Bezel, session: Session) {
+    s.active = Some(session.id);
+    s.sessions.push(session);
+}
+
+/// dc01 connected and current, dc02 connecting, fs01 asking for a password, a New host that
+/// ended.
+fn tabs(s: &mut Bezel) {
+    let library = library();
+    let connection = |id: &str| library.connection(&id.into()).cloned().expect("a fixture connection");
+    let ended = Ended {
+        message: "10.0.0.9 refused the connection on port 3389".into(),
+        details: "connection refused".into(),
+        by_user: false,
+    };
+    s.sessions = vec![
+        connected(1, &dc01()),
+        fixture_session(
+            2,
+            Destination::connection(&connection("n_dc02")),
+            Phase::Connecting,
+            None,
+        ),
+        session(3, Destination::connection(&connection("n_fs01")), fixture_sign_in()),
+        session(4, Destination::new_host(address("10.0.0.9")), Screen::Ended(ended)),
+    ];
+    s.active = Some(1);
+}
+
+fn address(host: &str) -> Address {
+    Address::parse(host).expect("a fixture address")
+}
+
+fn fs01() -> Address {
+    address("fs01.corp.lan")
 }
 
 fn dc01() -> Connection {

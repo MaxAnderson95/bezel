@@ -8,11 +8,11 @@ use bezel_core::library::{ConnectionId, GroupId, Section, Snapshot};
 use rune::{Drag, El, PointerPress, PopupItem, PopupMenu, Tx, col, el, row, text};
 use rune_kit::shell::RowStatus;
 use rune_kit::{
-    Button, ButtonVariant, ControlSize, IconButton, IconButtonVariant, Kit, Sidebar, SidebarHeader, SidebarRow,
+    Button, ButtonVariant, ControlSize, IconButton, IconButtonVariant, Keybind, Kit, Sidebar, SidebarHeader, SidebarRow,
 };
 use rune_theme_opencode::icons;
 
-use crate::app::{Bezel, Dot, Library};
+use crate::app::{Bezel, Dot, Library, Opening};
 use crate::manage::{Delete, Dragged, DropTargets};
 
 pub const WIDTH: f32 = 240.0;
@@ -24,7 +24,35 @@ pub fn sidebar(s: &Bezel, k: &Kit) -> El {
         Library::Loading => Sidebar::new(),
         Library::Failed(_) => Sidebar::new().child(faint(k, "Bezel can't read its data file")),
     };
-    column.child(list.label("Connections").footer(foot(s, k)).build(k))
+    column.child(list.label("Connections").header(search(k)).footer(foot(s, k)).build(k))
+}
+
+/// "Connect or search": opens the command palette.
+fn search(k: &Kit) -> El {
+    let field = row()
+        .key("sidebar-search")
+        .role("button")
+        .label("Connect or search")
+        .w_full()
+        .h(28.0)
+        .px(8.0)
+        .gap(8.0)
+        .center_y()
+        .radius(k.radius.md)
+        .fill(k.c.layer_01)
+        .border(1.0, k.c.border_weak)
+        .child(rune::icon(k.glyph.search, 14.0).color(k.c.icon_faint))
+        .child(
+            text("Connect or search")
+                .font(k.ty.ui)
+                .color(k.c.text_faint)
+                .grow(1.0)
+                .shrink()
+                .truncate(),
+        )
+        .child(Keybind::new(&["⌘", "K"]).build(k))
+        .on_press_tx(|s: &mut Bezel, tx: &mut Tx| s.open_palette(tx));
+    k.interactive(field)
 }
 
 fn faint(k: &Kit, message: &str) -> El {
@@ -116,19 +144,26 @@ fn section_el(
 
 fn connection_row(s: &Bezel, snapshot: &Snapshot, id: &ConnectionId, name: &str, targets: &DropTargets, k: &Kit) -> El {
     let dot = s.dot(id);
-    let edit = id.clone();
-    // "Open in new window" joins Edit here when M3 adds Session windows.
-    let actions = row().key("actions").gap(2.0).group_opacity(0.0, 1.0).child(
-        IconButton::new(&icons::PENCIL_LINE)
+    let (window, edit) = (id.clone(), id.clone());
+    // Pointer only, as the kit's row close button: the list's arrows step through rows.
+    let action = |glyph: &'static rune::Icon, label: &str, key: &'static str| {
+        IconButton::new(glyph)
             .variant(IconButtonVariant::GhostMuted)
             .control_size(ControlSize::Small)
-            .label("Edit")
-            .on_press(move |s: &mut Bezel| s.edit_connection(&edit))
+            .label(label.to_owned())
             .build(k)
-            .key("edit")
-            // Pointer only, as the kit's row close button: the list's arrows step through rows.
-            .focusable(false),
-    );
+            .key(key)
+            .focusable(false)
+    };
+    let actions = row()
+        .key("actions")
+        .gap(2.0)
+        .group_opacity(0.0, 1.0)
+        .child(
+            action(&icons::SQUARE_ARROW_TOP_RIGHT, "Open in new window", "window")
+                .on_press(move |s: &mut Bezel| s.open(&window, Opening::Window, false)),
+        )
+        .child(action(&icons::PENCIL_LINE, "Edit", "edit").on_press(move |s: &mut Bezel| s.edit_connection(&edit)));
     let mut sidebar_row = SidebarRow::new(name)
         .icon(&icons::MONITOR)
         .selected(dot.is_some())
@@ -145,7 +180,8 @@ fn connection_row(s: &Bezel, snapshot: &Snapshot, id: &ConnectionId, name: &str,
     let current = snapshot.connection(id).and_then(|c| c.group.clone());
     let targets = targets.clone();
     let built = sidebar_row
-        .on_select(move |s: &mut Bezel, _: &mut Tx| s.open(&open))
+        // ⌥-click opens another Session of a Connection that is already open.
+        .on_select(move |s: &mut Bezel, tx: &mut Tx| s.open(&open, Opening::Tab, tx.mods().alt))
         .build(k)
         .key(id.to_string())
         .on_secondary_press(move |_: &mut Bezel, press: PointerPress, tx: &mut Tx| {
@@ -175,9 +211,9 @@ fn connection_menu(groups: &[(GroupId, String)], current: Option<&GroupId>) -> P
             menu.item(PopupItem::new(format!("move-{i}"), name.clone()).checked(current == Some(group)))
         },
     );
-    // "Open in new window" joins Open when M3 adds Session windows.
     PopupMenu::new()
         .item(PopupItem::new("open", "Open"))
+        .item(PopupItem::new("window", "Open in new window"))
         .item(PopupItem::new("edit", "Edit…"))
         .item(PopupItem::new("duplicate", "Duplicate"))
         .submenu("Move to group", move_to)
@@ -187,7 +223,8 @@ fn connection_menu(groups: &[(GroupId, String)], current: Option<&GroupId>) -> P
 
 fn on_connection_menu(s: &mut Bezel, id: ConnectionId, groups: &[(GroupId, String)], picked: Option<&str>) {
     match picked {
-        Some("open") => s.open(&id),
+        Some("open") => s.open(&id, Opening::Tab, false),
+        Some("window") => s.open(&id, Opening::Window, false),
         Some("edit") => s.edit_connection(&id),
         Some("duplicate") => s.duplicate_connection(&id),
         Some("delete") => s.ask_delete(Delete::Connection(id)),

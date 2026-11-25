@@ -4,13 +4,16 @@ mod app;
 mod keychain;
 mod keymap;
 mod manage;
+mod palette;
 mod platform;
 mod pointer;
 mod scenes;
 mod sheets;
 mod sidebar;
 mod store;
+mod tabs;
 mod view;
+mod windows;
 
 use app::Bezel;
 use rune::AppSpec;
@@ -26,7 +29,7 @@ fn main() {
         ironrdp = bezel_rdp::IRONRDP_REVISION,
         "Bezel starting"
     );
-    rune::run(AppSpec::<Bezel> {
+    let spec = AppSpec::<Bezel> {
         min_size: Some((640.0, 420.0)),
         fonts: rune_theme_opencode::FONTS,
         families: rune_theme_opencode::FAMILIES,
@@ -35,7 +38,22 @@ fn main() {
         poll: Some(Bezel::poll),
         on_key: Some(Bezel::on_key),
         ..AppSpec::new("Bezel", (1280.0, 800.0), Bezel::new, view::view)
-    });
+    };
+    // A headless render has one window and no turns, so its state is the shared one.
+    if rune::is_headless() {
+        return rune::run(spec);
+    }
+    let (home, husk, main_window) = windows::home();
+    let app = rune::App::new(spec)
+        .init(move || husk)
+        .keep_running()
+        .turn_scope(windows::enter, windows::leave)
+        .on_close_request(windows::on_main_close_request)
+        .on_quit_request(windows::on_quit_request)
+        .on_reopen(windows::on_reopen)
+        .on_window(move |window| *main_window.borrow_mut() = Some(window.clone()));
+    home.borrow_mut().main = Some(app.handle());
+    app.run();
 }
 
 /// A daily log in the platform log folder, keeping a week. IronRDP and the libraries under it

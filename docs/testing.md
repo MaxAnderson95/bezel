@@ -40,3 +40,16 @@ Use `scripts/bundle.sh` and open `Bezel.app` (the bundle declares Retina support
 - [ ] Certificates lists the remembered certificates and Remove forgets one (the next Session asks again).
 - [ ] ⌃⌘S hides and shows the sidebar, with the desktop focused and without.
 - [ ] Hand-edit `bezel.toml` (add a key Bezel doesn't know to a Connection, then break the file): the unknown key survives an edit in Bezel; the broken file shows its line and Open data folder and is not overwritten.
+
+## M3: tabs, Session windows and the palette
+
+- [ ] From launch, without the mouse: ⌘K, type a saved Connection, Return opens it in a Tab; repeat until five Sessions are open, using ⌥Return on an open one for a second Session, a typed host for a New host, and ⌘Return for one in a Session window. ⌘1 to ⌘9 and ⇧⌘[ / ⇧⌘] switch Tabs; ⌘W closes the current one.
+- [ ] Choosing an open Connection in the sidebar or the palette switches to its Tab or Session window; ⌥-click in the sidebar opens another Session.
+- [ ] Drag a Tab down off the tab row: it becomes a Session window under the pointer, still connected (no "Connecting…", the remote desktop keeps its state). Move to new window in the Tab's context menu and the tab row's actions does the same.
+- [ ] In a Session window: the title bar shows the name, the status line appears on hover, Send Ctrl+Alt+Del reaches Windows, and Move to main window makes it the last Tab, still connected.
+- [ ] Drag a Session window by its title bar onto the Main window's tab row: it becomes a Tab again, still connected.
+- [ ] The sidebar's hover action and Open in new window open a Connection straight into a Session window.
+- [ ] The empty panel's field connects to a typed host, and on first run shows Add connection.
+- [ ] ⌃⌘F: the sidebar and tab row hide; the pointer at the top edge shows the tab row; ⌘K and tab switching still work.
+- [ ] The Main window's close button hides it and its Sessions keep running; the Dock icon brings it back. (A utility that quits apps when their last window closes, such as Vorssaint, will send Bezel a quit instead; with Sessions open Bezel then asks.)
+- [ ] ⌘Q with Sessions open asks "Disconnect 3 Sessions and quit?" once; with none it quits at once.
