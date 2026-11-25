@@ -7,7 +7,7 @@ use std::path::{Path, PathBuf};
 
 use serde::{Deserialize, Serialize};
 
-use crate::trust::TrustedCertificate;
+use crate::trust::{Fingerprint, TrustedCertificate};
 
 const VERSION: u32 = 1;
 
@@ -29,8 +29,13 @@ impl Snapshot {
 
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum Change {
-    /// Stores the certificate, replacing any already trusted for its host and port.
-    RememberCertificate(TrustedCertificate),
+    /// Stores the certificate in place of `replacing`, the fingerprint of the Trusted
+    /// certificate the person saw for that host and port (`None` when none was trusted). If the
+    /// file holds a different one by then, the change is refused.
+    RememberCertificate {
+        certificate: TrustedCertificate,
+        replacing: Option<Fingerprint>,
+    },
     ForgetCertificate {
         host: String,
         port: u16,
@@ -51,6 +56,8 @@ pub enum LibraryError {
     Version { path: PathBuf, found: u32 },
     #[error("{} could not be saved: {source}", path.display())]
     Write { path: PathBuf, source: io::Error },
+    #[error("A different certificate for {host}:{port} was remembered while this one was being checked")]
+    Conflict { host: String, port: u16 },
 }
 
 #[derive(Serialize, Deserialize)]
@@ -90,9 +97,19 @@ impl Library {
         let mut file = read(&self.path)?;
         let certificates = &mut file.trusted_certificates;
         match change {
-            Change::RememberCertificate(trusted) => {
-                certificates.retain(|t| !t.is_for(&trusted.host, trusted.port));
-                certificates.push(trusted);
+            Change::RememberCertificate { certificate, replacing } => {
+                let current = certificates
+                    .iter()
+                    .find(|t| t.is_for(&certificate.host, certificate.port));
+                let on_disk = current.map(|t| t.sha256);
+                if on_disk != replacing && on_disk != Some(certificate.sha256) {
+                    return Err(LibraryError::Conflict {
+                        host: certificate.host,
+                        port: certificate.port,
+                    });
+                }
+                certificates.retain(|t| !t.is_for(&certificate.host, certificate.port));
+                certificates.push(certificate);
             }
             Change::ForgetCertificate { host, port } => certificates.retain(|t| !t.is_for(&host, port)),
         }
@@ -234,6 +251,13 @@ mod tests {
         }
     }
 
+    fn remember(certificate: TrustedCertificate) -> Change {
+        Change::RememberCertificate {
+            certificate,
+            replacing: None,
+        }
+    }
+
     fn temp_path() -> (tempfile::TempDir, PathBuf) {
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("Bezel").join("bezel.toml");
@@ -252,12 +276,8 @@ mod tests {
     fn remembered_certificates_round_trip() {
         let (_dir, path) = temp_path();
         let mut library = Library::open(&path).unwrap();
-        library
-            .apply(Change::RememberCertificate(trusted("fs01.corp.lan", 1)))
-            .unwrap();
-        library
-            .apply(Change::RememberCertificate(trusted("dc01.corp.lan", 2)))
-            .unwrap();
+        library.apply(remember(trusted("fs01.corp.lan", 1))).unwrap();
+        library.apply(remember(trusted("dc01.corp.lan", 2))).unwrap();
         let reopened = Library::open(&path).unwrap().snapshot();
         assert_eq!(reopened, library.snapshot());
         assert_eq!(
@@ -271,7 +291,7 @@ mod tests {
         let (_dir, path) = temp_path();
         Library::open(&path)
             .unwrap()
-            .apply(Change::RememberCertificate(trusted("fs01.corp.lan", 1)))
+            .apply(remember(trusted("fs01.corp.lan", 1)))
             .unwrap();
         let text = fs::read_to_string(&path).unwrap();
         assert!(text.starts_with("version = 1\n"), "{text}");
@@ -284,11 +304,12 @@ mod tests {
     fn remembering_replaces_the_certificate_for_that_host() {
         let (_dir, path) = temp_path();
         let mut library = Library::open(&path).unwrap();
+        library.apply(remember(trusted("fs01.corp.lan", 1))).unwrap();
         library
-            .apply(Change::RememberCertificate(trusted("fs01.corp.lan", 1)))
-            .unwrap();
-        library
-            .apply(Change::RememberCertificate(trusted("FS01.corp.lan", 2)))
+            .apply(Change::RememberCertificate {
+                certificate: trusted("FS01.corp.lan", 2),
+                replacing: Some(trusted("fs01.corp.lan", 1).sha256),
+            })
             .unwrap();
         assert_eq!(
             library.snapshot().trusted_certificates,
@@ -297,12 +318,32 @@ mod tests {
     }
 
     #[test]
+    fn remembering_refuses_to_replace_a_certificate_the_person_did_not_see() {
+        let (_dir, path) = temp_path();
+        let mut stale = Library::open(&path).unwrap();
+        let mut other = Library::open(&path).unwrap();
+        other.apply(remember(trusted("fs01.corp.lan", 1))).unwrap();
+        assert!(matches!(
+            stale.apply(remember(trusted("fs01.corp.lan", 2))),
+            Err(LibraryError::Conflict { .. })
+        ));
+        let changed = Change::RememberCertificate {
+            certificate: trusted("fs01.corp.lan", 3),
+            replacing: Some(trusted("fs01.corp.lan", 9).sha256),
+        };
+        assert!(matches!(other.apply(changed), Err(LibraryError::Conflict { .. })));
+        assert_eq!(
+            Library::open(&path).unwrap().snapshot().trusted_certificates,
+            vec![trusted("fs01.corp.lan", 1)]
+        );
+        stale.apply(remember(trusted("fs01.corp.lan", 1))).unwrap();
+    }
+
+    #[test]
     fn forgetting_removes_it() {
         let (_dir, path) = temp_path();
         let mut library = Library::open(&path).unwrap();
-        library
-            .apply(Change::RememberCertificate(trusted("fs01.corp.lan", 1)))
-            .unwrap();
+        library.apply(remember(trusted("fs01.corp.lan", 1))).unwrap();
         library
             .apply(Change::ForgetCertificate {
                 host: "fs01.corp.lan".into(),
@@ -343,7 +384,7 @@ mod tests {
         fs::write(&path, "version = 1\n\n[settings]\nappearance = \"dark\"\n\n[[groups]]\nid = \"g_7k2m\"\nname = \"Infrastructure\"\n").unwrap();
         Library::open(&path)
             .unwrap()
-            .apply(Change::RememberCertificate(trusted("fs01.corp.lan", 1)))
+            .apply(remember(trusted("fs01.corp.lan", 1)))
             .unwrap();
         let saved: toml::Table = toml::from_str(&fs::read_to_string(&path).unwrap()).unwrap();
         assert_eq!(saved["settings"]["appearance"].as_str(), Some("dark"));
@@ -356,9 +397,7 @@ mod tests {
         let (_dir, path) = temp_path();
         let mut library = Library::open(&path).unwrap();
         let mut other = Library::open(&path).unwrap();
-        other
-            .apply(Change::RememberCertificate(trusted("dc01.corp.lan", 2)))
-            .unwrap();
+        other.apply(remember(trusted("dc01.corp.lan", 2))).unwrap();
         fs::write(
             &path,
             format!(
@@ -367,9 +406,7 @@ mod tests {
             ),
         )
         .unwrap();
-        library
-            .apply(Change::RememberCertificate(trusted("fs01.corp.lan", 1)))
-            .unwrap();
+        library.apply(remember(trusted("fs01.corp.lan", 1))).unwrap();
         let saved: toml::Table = toml::from_str(&fs::read_to_string(&path).unwrap()).unwrap();
         assert_eq!(saved["settings"]["appearance"].as_str(), Some("dark"));
         assert_eq!(
@@ -382,13 +419,11 @@ mod tests {
     fn a_change_is_refused_when_the_file_stopped_parsing_after_it_was_opened() {
         let (_dir, path) = temp_path();
         let mut library = Library::open(&path).unwrap();
-        library
-            .apply(Change::RememberCertificate(trusted("fs01.corp.lan", 1)))
-            .unwrap();
+        library.apply(remember(trusted("fs01.corp.lan", 1))).unwrap();
         let broken = "version = 1\n[[trusted_certificates]\n";
         fs::write(&path, broken).unwrap();
         assert!(matches!(
-            library.apply(Change::RememberCertificate(trusted("dc01.corp.lan", 2))),
+            library.apply(remember(trusted("dc01.corp.lan", 2))),
             Err(LibraryError::Parse { .. })
         ));
         assert_eq!(fs::read_to_string(&path).unwrap(), broken);
@@ -405,11 +440,7 @@ mod tests {
         let path = dir.path().join("bezel.toml");
         let mut library = Library::open(&path).unwrap();
         fs::create_dir_all(&path).unwrap();
-        assert!(
-            library
-                .apply(Change::RememberCertificate(trusted("fs01.corp.lan", 1)))
-                .is_err()
-        );
+        assert!(library.apply(remember(trusted("fs01.corp.lan", 1))).is_err());
         assert!(library.snapshot().trusted_certificates.is_empty());
     }
 }

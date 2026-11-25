@@ -1,6 +1,5 @@
 //! What to do with a server's certificate, and the details its dialogs show.
 
-use std::collections::HashSet;
 use std::fmt;
 use std::str::FromStr;
 
@@ -160,14 +159,14 @@ pub enum Question {
 }
 
 /// `trusted` is the Trusted certificate for the host the Session connects to, and
-/// `trusted_once` the fingerprints accepted without Remember during this Session.
+/// `trusted_once` the certificate accepted without Remember during this Session, if any.
 pub fn decide(
     presented: &Certificate,
     chain_valid: bool,
     trusted: Option<&TrustedCertificate>,
-    trusted_once: &HashSet<Fingerprint>,
+    trusted_once: Option<&Fingerprint>,
 ) -> Decision {
-    if chain_valid || trusted_once.contains(&presented.sha256) {
+    if chain_valid || trusted_once == Some(&presented.sha256) {
         return Decision::Accept;
     }
     match trusted {
@@ -177,6 +176,43 @@ pub fn decide(
             presented: presented.clone(),
         }),
         None => Decision::Ask(Question::FirstUse(presented.clone())),
+    }
+}
+
+/// What one Session trusts beyond the Mac's chain: a pinned certificate (the Trusted
+/// certificate it started with, or one accepted in its place since) and at most one certificate
+/// trusted without Remember. Each answer replaces what it supersedes, so a certificate the
+/// person moved away from is asked about again if it comes back.
+#[derive(Clone, Debug, Default)]
+pub struct SessionTrust {
+    pinned: Option<TrustedCertificate>,
+    once: Option<Fingerprint>,
+}
+
+impl SessionTrust {
+    pub fn new(pinned: Option<TrustedCertificate>) -> Self {
+        Self { pinned, once: None }
+    }
+
+    /// The decision for a certificate the Mac's chain did not validate.
+    pub fn decide(&self, presented: &Certificate) -> Decision {
+        decide(presented, false, self.pinned.as_ref(), self.once.as_ref())
+    }
+
+    /// Records that the person trusted the certificate `question` asked about. A remembered
+    /// first-use certificate or a changed one becomes the pin; one trusted without Remember
+    /// becomes the Session's single exception.
+    pub fn accept(&mut self, host: &str, port: u16, question: &Question, remember: bool, today: Date) {
+        match question {
+            Question::FirstUse(certificate) if !remember => self.once = Some(certificate.sha256),
+            Question::FirstUse(certificate)
+            | Question::Changed {
+                presented: certificate, ..
+            } => {
+                self.pinned = Some(TrustedCertificate::new(host, port, certificate, today));
+                self.once = None;
+            }
+        }
     }
 }
 
@@ -219,17 +255,14 @@ mod tests {
     #[test]
     fn a_chain_the_mac_trusts_is_accepted_silently() {
         let other = trusted(Fingerprint([7; 32]));
-        assert_eq!(decide(&presented(), true, None, &HashSet::new()), Decision::Accept);
-        assert_eq!(
-            decide(&presented(), true, Some(&other), &HashSet::new()),
-            Decision::Accept
-        );
+        assert_eq!(decide(&presented(), true, None, None), Decision::Accept);
+        assert_eq!(decide(&presented(), true, Some(&other), None), Decision::Accept);
     }
 
     #[test]
     fn an_unknown_host_asks_on_first_use() {
         assert_eq!(
-            decide(&presented(), false, None, &HashSet::new()),
+            decide(&presented(), false, None, None),
             Decision::Ask(Question::FirstUse(presented()))
         );
     }
@@ -237,17 +270,14 @@ mod tests {
     #[test]
     fn a_matching_trusted_certificate_is_accepted() {
         let trusted = trusted(presented().sha256);
-        assert_eq!(
-            decide(&presented(), false, Some(&trusted), &HashSet::new()),
-            Decision::Accept
-        );
+        assert_eq!(decide(&presented(), false, Some(&trusted), None), Decision::Accept);
     }
 
     #[test]
     fn a_different_certificate_asks_about_the_change() {
         let old = trusted(Fingerprint([7; 32]));
         assert_eq!(
-            decide(&presented(), false, Some(&old), &HashSet::new()),
+            decide(&presented(), false, Some(&old), None),
             Decision::Ask(Question::Changed {
                 trusted: old.clone(),
                 presented: presented()
@@ -257,10 +287,67 @@ mod tests {
 
     #[test]
     fn trust_without_remember_lasts_for_the_session() {
-        let once = HashSet::from([presented().sha256]);
-        assert_eq!(decide(&presented(), false, None, &once), Decision::Accept);
+        let once = Some(&presented().sha256);
+        assert_eq!(decide(&presented(), false, None, once), Decision::Accept);
         let old = trusted(Fingerprint([7; 32]));
-        assert_eq!(decide(&presented(), false, Some(&old), &once), Decision::Accept);
+        assert_eq!(decide(&presented(), false, Some(&old), once), Decision::Accept);
+    }
+
+    fn other(fill: u8) -> Certificate {
+        Certificate {
+            sha256: Fingerprint([fill; 32]),
+            ..presented()
+        }
+    }
+
+    fn ask_and_accept(session: &mut SessionTrust, certificate: &Certificate, remember: bool) -> Question {
+        let Decision::Ask(question) = session.decide(certificate) else {
+            panic!("{certificate:?} was accepted without asking");
+        };
+        session.accept("fs01.corp.lan", 3389, &question, remember, date!(2026 - 11 - 25));
+        question
+    }
+
+    #[test]
+    fn a_session_asks_again_for_every_certificate_it_moved_away_from() {
+        let (a, b, c) = (presented(), other(1), other(2));
+        let mut session = SessionTrust::new(Some(trusted(a.sha256)));
+        assert_eq!(session.decide(&a), Decision::Accept);
+        assert!(matches!(
+            ask_and_accept(&mut session, &b, true),
+            Question::Changed { .. }
+        ));
+        assert!(matches!(
+            ask_and_accept(&mut session, &c, true),
+            Question::Changed { .. }
+        ));
+        assert_eq!(session.decide(&c), Decision::Accept);
+        for old in [&a, &b] {
+            assert!(
+                matches!(session.decide(old), Decision::Ask(Question::Changed { .. })),
+                "{old:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn a_remembered_first_use_pins_the_certificate_for_the_session() {
+        let (a, b) = (presented(), other(1));
+        let mut session = SessionTrust::new(None);
+        assert!(matches!(ask_and_accept(&mut session, &a, true), Question::FirstUse(_)));
+        assert_eq!(session.decide(&a), Decision::Accept);
+        assert!(matches!(session.decide(&b), Decision::Ask(Question::Changed { .. })));
+    }
+
+    #[test]
+    fn trust_without_remember_keeps_only_the_latest_exception() {
+        let (a, b) = (presented(), other(1));
+        let mut session = SessionTrust::new(None);
+        ask_and_accept(&mut session, &a, false);
+        assert_eq!(session.decide(&a), Decision::Accept);
+        assert!(matches!(ask_and_accept(&mut session, &b, false), Question::FirstUse(_)));
+        assert_eq!(session.decide(&b), Decision::Accept);
+        assert!(matches!(session.decide(&a), Decision::Ask(Question::FirstUse(_))));
     }
 
     #[test]
