@@ -18,7 +18,13 @@ pub type ChangeId = u64;
 
 pub enum Reply {
     Loaded(Loaded),
-    Saved(ChangeId, Result<Snapshot, String>),
+    /// The Library as it stands after the change, which a refused change can also update
+    /// (another Bezel remembered a different certificate), and the error if it was refused.
+    Saved {
+        id: ChangeId,
+        snapshot: Snapshot,
+        error: Option<String>,
+    },
 }
 
 pub struct Store {
@@ -47,14 +53,15 @@ impl Store {
                 }
             };
             for (id, change) in receiver {
-                let saved = library
-                    .apply(change)
-                    .map(|()| library.snapshot())
-                    .map_err(|e| e.to_string());
-                if let Err(e) = &saved {
+                let error = library.apply(change).err().map(|e| e.to_string());
+                if let Some(e) = &error {
                     tracing::error!(error = %e, "library not saved");
                 }
-                worker(Reply::Saved(id, saved));
+                worker(Reply::Saved {
+                    id,
+                    snapshot: library.snapshot(),
+                    error,
+                });
             }
         });
         if let Err(e) = spawned {

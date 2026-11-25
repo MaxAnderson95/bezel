@@ -91,7 +91,9 @@ impl Library {
     /// Applies the change to the file as it is on disk now and saves it. A hand edit or another
     /// Bezel may have changed the file since it was opened, so the change never replaces it
     /// with an older copy, and a file that no longer parses is refused rather than overwritten.
-    /// On any error the file and the Library are left as they were.
+    /// On any error the file is left as it was. The Library keeps its previous state too, except
+    /// after a `Conflict`, when it takes the certificates now on disk so the next Session
+    /// expects what another Bezel remembered.
     pub fn apply(&mut self, change: Change) -> Result<(), LibraryError> {
         let _lock = lock(&self.path)?;
         let mut file = read(&self.path)?;
@@ -103,6 +105,7 @@ impl Library {
                     .find(|t| t.is_for(&certificate.host, certificate.port));
                 let on_disk = current.map(|t| t.sha256);
                 if on_disk != replacing && on_disk != Some(certificate.sha256) {
+                    self.file = file;
                     return Err(LibraryError::Conflict {
                         host: certificate.host,
                         port: certificate.port,
@@ -237,7 +240,7 @@ mod tests {
     use time::macros::date;
 
     use super::*;
-    use crate::trust::Fingerprint;
+    use crate::trust::{Certificate, Decision, Question, SessionTrust};
 
     fn trusted(host: &str, fill: u8) -> TrustedCertificate {
         TrustedCertificate {
@@ -248,6 +251,17 @@ mod tests {
             issuer: host.into(),
             not_after: date!(2027 - 03 - 14),
             remembered: date!(2026 - 10 - 03),
+        }
+    }
+
+    fn certificate(fill: u8) -> Certificate {
+        Certificate {
+            sha256: Fingerprint::of(&[fill]),
+            subject: "fs01.corp.lan".into(),
+            issuer: "fs01.corp.lan".into(),
+            self_signed: true,
+            not_before: date!(2026 - 03 - 14),
+            not_after: date!(2027 - 03 - 14),
         }
     }
 
@@ -323,9 +337,21 @@ mod tests {
         let mut stale = Library::open(&path).unwrap();
         let mut other = Library::open(&path).unwrap();
         other.apply(remember(trusted("fs01.corp.lan", 1))).unwrap();
+        let expected_by_stale = stale.snapshot().trusted_certificate("fs01.corp.lan", 3389).cloned();
+        assert_eq!(expected_by_stale, None);
         assert!(matches!(
             stale.apply(remember(trusted("fs01.corp.lan", 2))),
             Err(LibraryError::Conflict { .. })
+        ));
+        // The refused Library now knows the certificate the other Bezel remembered, so the next
+        // Session from it treats any other certificate, including the refused one, as a change.
+        let pin = stale.snapshot().trusted_certificate("fs01.corp.lan", 3389).cloned();
+        assert_eq!(pin, Some(trusted("fs01.corp.lan", 1)));
+        let session = SessionTrust::new(pin);
+        assert_eq!(session.decide(&certificate(1)), Decision::Accept);
+        assert!(matches!(
+            session.decide(&certificate(2)),
+            Decision::Ask(Question::Changed { .. })
         ));
         let changed = Change::RememberCertificate {
             certificate: trusted("fs01.corp.lan", 3),

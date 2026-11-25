@@ -170,19 +170,21 @@ impl Bezel {
                     self.connect(address, username, password);
                 }
             }
-            Reply::Saved(id, saved) => {
+            Reply::Saved { id, snapshot, error } => {
+                // A refused change can still bring news from disk, such as a certificate another
+                // Bezel remembered, which the next Session must expect.
+                self.library = Library::Ready(snapshot);
                 let session = match &mut self.screen {
                     Screen::Session(live) if live.trust == Trust::Remembering(id) => Some(live),
                     _ => None,
                 };
-                match saved {
-                    Ok(snapshot) => {
+                match error {
+                    None => {
                         if let Some(live) = session {
                             live.trust = Trust::Verified;
                         }
-                        self.library = Library::Ready(snapshot);
                     }
-                    Err(e) => {
+                    Some(e) => {
                         self.notice = Some(match session {
                             Some(live) => {
                                 live.trust = Trust::ThisSession;
