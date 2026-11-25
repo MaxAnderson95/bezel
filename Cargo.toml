@@ -25,6 +25,7 @@ rune-theme-opencode = { git = "https://github.com/anomalyco/rune", rev = "ee84b9
 
 ironrdp-client = { git = "https://github.com/Devolutions/IronRDP", rev = "a0ad31cb864a25ec077034db2d4ced19575d5c20", features = ["rustls"] }
 ironrdp-connector = { git = "https://github.com/Devolutions/IronRDP", rev = "a0ad31cb864a25ec077034db2d4ced19575d5c20" }
+ironrdp-displaycontrol = { git = "https://github.com/Devolutions/IronRDP", rev = "a0ad31cb864a25ec077034db2d4ced19575d5c20" }
 ironrdp-input = { git = "https://github.com/Devolutions/IronRDP", rev = "a0ad31cb864a25ec077034db2d4ced19575d5c20" }
 ironrdp-pdu = { git = "https://github.com/Devolutions/IronRDP", rev = "a0ad31cb864a25ec077034db2d4ced19575d5c20" }
 ironrdp-session = { git = "https://github.com/Devolutions/IronRDP", rev = "a0ad31cb864a25ec077034db2d4ced19575d5c20" }
@@ -34,6 +35,7 @@ anyhow = "1"
 png = "0.18"
 serde = { version = "1", features = ["derive"] }
 sha2 = "0.10"
+smallvec = "1"
 thiserror = "2"
 time = { version = "0.3", features = ["macros"] }
 tokio = { version = "1", features = ["rt-multi-thread", "sync", "time", "macros"] }

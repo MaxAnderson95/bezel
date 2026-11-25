@@ -13,26 +13,29 @@ use std::pin::Pin;
 use std::sync::{Arc, Mutex, PoisonError};
 use std::time::Duration;
 
-use bezel_core::trust::{self, Certificate, CertificateError, Decision, Fingerprint, Question};
+use bezel_core::trust::{self, Certificate, CertificateError, Decision, Fingerprint, Question, TrustedCertificate};
 use ironrdp_client::config::{Config, ConfigBuilder, Destination};
 use ironrdp_client::output_channel::{OutputEventReceiver, output_channel};
 use ironrdp_client::rdp::{RdpClient, RdpInputEvent, RdpInputSender, RdpOutputEvent};
 use ironrdp_input::{Database, MousePosition, Operation};
 use ironrdp_pdu::rdp::capability_sets::MajorPlatformType;
 use rune_image::Pixels;
+use tokio::sync::mpsc::error::TrySendError;
 use tokio::sync::{mpsc, oneshot};
 use tokio::time::Instant;
 use tracing::{debug, info, warn};
 
 use crate::failure::{self, Ended, Failure};
 use crate::framebuffer::{Framebuffer, Region};
-use crate::input::{self, Wheel};
+use crate::input::{self, Outbox, Wheel};
 use crate::retina::Desktop;
 use crate::{Auth, CertificateRequest, Command, Event, Input, Pointer, PointerShape, State, Target, View};
 
 type Emit = Arc<dyn Fn(Event) + Send + Sync>;
 
 const RESIZE_DEBOUNCE: Duration = Duration::from_millis(250);
+/// How soon to offer queued input to IronRDP again after its queue was full.
+const INPUT_RETRY: Duration = Duration::from_millis(5);
 
 pub(crate) fn spawn(
     target: Target,
@@ -118,6 +121,17 @@ impl Engine {
                 Outcome::Ended(event) => return self.emit(event),
                 Outcome::Ask(question) => question,
             };
+            // Trusting a changed certificate replaces the pin for the rest of this Session too,
+            // so a later handshake presenting the old certificate is asked about again.
+            let replacement = match &question {
+                Question::Changed { presented, .. } => Some(TrustedCertificate::new(
+                    &host,
+                    port,
+                    presented,
+                    time::OffsetDateTime::now_utc().date(),
+                )),
+                Question::FirstUse(_) => None,
+            };
             let presented = match &question {
                 Question::FirstUse(presented) | Question::Changed { presented, .. } => presented.sha256,
             };
@@ -142,6 +156,9 @@ impl Engine {
                 return self.emit(Event::State(State::Disconnected(Ended::by_user())));
             }
             info!(%host, port, fingerprint = %presented, "certificate trusted for this session");
+            if let Some(replacement) = replacement {
+                self.target.trusted_certificate = Some(replacement);
+            }
             self.trusted_once
                 .lock()
                 .unwrap_or_else(PoisonError::into_inner)
@@ -168,6 +185,7 @@ impl Engine {
         let client = RdpClient::new(config, sender).with_desktop_updates();
         let mut attempt = Attempt {
             input: client.input_sender(),
+            outbox: Outbox::default(),
             database: Database::new(),
             wheel: Wheel::default(),
             requested,
@@ -201,6 +219,7 @@ impl Engine {
             };
             tokio::select! {
                 () = &mut run, if running => running = false,
+                () = tokio::time::sleep(INPUT_RETRY), if !attempt.outbox.is_empty() => attempt.flush(),
                 event = receiver.recv() => {
                     let mut next = event;
                     // Take every event already waiting before publishing, so a burst of updates
@@ -315,6 +334,7 @@ impl Engine {
                 info!(%host, message = %ended.message, "session ended");
                 return Some(Outcome::Ended(disconnected(ended)));
             }
+            RdpOutputEvent::MonitorLayoutRejected => warn!(%host, "the server refused the new desktop size"),
             RdpOutputEvent::LogonError(info) => info!(%host, ?info, "the server reported a logon error"),
             other => debug!(event = ?std::mem::discriminant(&other), "ignored output event"),
         }
@@ -338,10 +358,8 @@ impl Engine {
             Input::Wheel { dx, dy } => attempt.wheel.rotations(dx, dy),
             Input::Keys(ops) => ops.into_iter().map(input::key).collect(),
             Input::ReleaseAll => {
-                let batch = attempt.database.release_all();
-                if !batch.is_empty() {
-                    let _ = attempt.input.try_send(RdpInputEvent::FastPath(batch));
-                }
+                attempt.outbox.push(attempt.database.release_all());
+                attempt.flush();
                 Vec::new()
             }
         }
@@ -408,6 +426,9 @@ impl Engine {
 
 struct Attempt {
     input: RdpInputSender,
+    /// Input waiting for room in IronRDP's bounded queue, in order.
+    outbox: Outbox,
+    /// The key and button state of the input queued so far.
     database: Database,
     wheel: Wheel,
     /// What the server was last asked for.
@@ -419,36 +440,40 @@ struct Attempt {
 
 impl Attempt {
     fn send(&mut self, ops: Vec<Operation>) {
-        if ops.is_empty() {
-            return;
+        if !ops.is_empty() {
+            self.outbox.push(self.database.apply(ops));
+            self.flush();
         }
-        // Reserve first so the key and button state only changes for input that is sent.
-        let Ok(permit) = self.input.try_reserve() else {
-            warn!("input queue full; dropping input");
-            return;
-        };
-        let batch = self.database.apply(ops);
-        if !batch.is_empty() {
-            permit.send(RdpInputEvent::FastPath(batch));
-        }
+    }
+
+    fn flush(&mut self) {
+        let input = &self.input;
+        self.outbox
+            .flush(|batch| match input.try_send(RdpInputEvent::FastPath(batch)) {
+                Ok(()) => Ok(()),
+                Err(TrySendError::Full(RdpInputEvent::FastPath(batch))) => Err(batch),
+                // The session is closing; its end arrives as an output event.
+                Err(_) => Ok(()),
+            });
     }
 
     fn resize_to(&mut self, desktop: Desktop) {
         if !self.connected || desktop == self.requested {
             return;
         }
-        let event = RdpInputEvent::Resize {
-            width: desktop.width,
-            height: desktop.height,
-            scale_factor: desktop.desktop_scale,
-            physical_size: None,
+        let layout = match desktop.layout() {
+            Ok(layout) => layout,
+            Err(e) => return warn!(error = %e, ?desktop, "no monitor layout for this size"),
         };
-        match self.input.try_send(event) {
+        match self.input.try_send(RdpInputEvent::MonitorLayout(layout)) {
             Ok(()) => {
                 info!(?desktop, "resizing");
                 self.requested = desktop;
             }
-            Err(e) => warn!(error = %e, "resize not queued"),
+            Err(e) => {
+                warn!(error = %e, "resize not queued; trying again");
+                self.resize_at = Some(Instant::now() + INPUT_RETRY);
+            }
         }
     }
 }

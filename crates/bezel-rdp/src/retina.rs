@@ -1,6 +1,10 @@
 //! The Retina recipe: ask Windows for the desktop in device pixels and tell it the scale, so
 //! frames draw one remote pixel per screen pixel.
 
+use ironrdp_displaycontrol::pdu::{
+    DeviceScaleFactor, DisplayControlMonitorLayout, MonitorLayoutEntry, MonitorOrientation,
+};
+
 use crate::View;
 
 /// What a View asks of the server.
@@ -44,6 +48,28 @@ impl Desktop {
             desktop_scale,
             device_scale,
         }
+    }
+}
+
+impl Desktop {
+    /// A Display Control layout carrying both scale factors, so a live resize keeps the device
+    /// scale the connection started with instead of IronRDP deriving another from the desktop
+    /// scale.
+    pub fn layout(&self) -> Result<DisplayControlMonitorLayout, impl std::fmt::Display + std::fmt::Debug + use<>> {
+        let orientation = if self.height > self.width {
+            MonitorOrientation::Portrait
+        } else {
+            MonitorOrientation::Landscape
+        };
+        let device_scale =
+            DeviceScaleFactor::from_value(self.device_scale).unwrap_or(DeviceScaleFactor::Scale100Percent);
+        MonitorLayoutEntry::new_primary(self.width.into(), self.height.into())
+            .and_then(|entry| {
+                entry
+                    .with_orientation(orientation)
+                    .with_desktop_scale_factor(self.desktop_scale)
+            })
+            .and_then(|entry| DisplayControlMonitorLayout::new(&[entry.with_device_scale_factor(device_scale)]))
     }
 }
 
@@ -109,6 +135,15 @@ mod tests {
             (desktop(5000.0, 5000.0, 2.0).width, desktop(5000.0, 5000.0, 2.0).height),
             (8192, 8192)
         );
+    }
+
+    #[test]
+    fn the_layout_carries_both_scale_factors() {
+        let layout = desktop(800.0, 600.0, 1.25).layout().unwrap();
+        let monitor = &layout.monitors()[0];
+        assert_eq!(monitor.dimensions(), (1000, 750));
+        assert_eq!(monitor.desktop_scale_factor(), Some(125));
+        assert_eq!(monitor.device_scale_factor(), Some(DeviceScaleFactor::Scale140Percent));
     }
 
     #[test]
