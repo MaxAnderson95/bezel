@@ -22,7 +22,7 @@ pub fn view(s: &Bezel, cx: &mut Cx<Bezel>) -> El {
     let content = match &s.screen {
         Screen::Idle => idle(s, k),
         Screen::SignIn(sign_in) => {
-            sign_in_dialog(sign_in, k, &mut layer);
+            sign_in_dialog(sign_in, s.is_waiting(), k, &mut layer);
             idle(s, k)
         }
         Screen::Session(live) => {
@@ -232,7 +232,7 @@ fn notice(k: &Kit, message: &str, detail: &str, open_folder: bool) -> El {
     card
 }
 
-fn sign_in_dialog(sign_in: &SignIn, k: &Kit, layer: &mut Vec<El>) {
+fn sign_in_dialog(sign_in: &SignIn, waiting: bool, k: &Kit, layer: &mut Vec<El>) {
     let username = Field::new()
         .label("Username")
         .control(
@@ -278,8 +278,9 @@ fn sign_in_dialog(sign_in: &SignIn, k: &Kit, layer: &mut Vec<El>) {
     }
     body = body.child(buttons(
         Button::new("Cancel").on_press(Bezel::cancel_sign_in).build(k),
-        Button::new("Connect")
+        Button::new(if waiting { "Connecting…" } else { "Connect" })
             .variant(ButtonVariant::Contrast)
+            .disabled(waiting)
             .on_press(Bezel::sign_in)
             .build(k)
             .key("sign-in-connect")

@@ -13,7 +13,7 @@ use rune::{PhysicalInput, TextEdit, Tx, Waker};
 
 use crate::keymap::{self, Translated};
 use crate::platform;
-use crate::store::{Loaded, Reply, Store};
+use crate::store::{ChangeId, Loaded, Reply, Store};
 
 pub struct Bezel {
     waker: Option<Waker>,
@@ -37,6 +37,7 @@ pub struct Bezel {
     waiting: Option<(Address, Username, String)>,
     /// The app menu's Hide shortcuts no longer claim ⌘H and ⌥⌘H.
     menus_ready: bool,
+    next_change: ChangeId,
 }
 
 pub enum Library {
@@ -83,8 +84,9 @@ pub enum Trust {
     Verified,
     /// Trusted for this Session only, by choice or because remembering it failed.
     ThisSession,
-    /// Trusted, and waiting for the Library to confirm it saved the Trusted certificate.
-    Remembering,
+    /// Trusted, and waiting for the Library to confirm it saved the Trusted certificate in the
+    /// change with this ID.
+    Remembering(ChangeId),
 }
 
 #[derive(Clone, Copy, PartialEq, Eq)]
@@ -127,6 +129,7 @@ impl Bezel {
             last_username: String::new(),
             waiting: None,
             menus_ready: false,
+            next_change: 0,
         }
     }
 
@@ -157,10 +160,6 @@ impl Bezel {
     }
 
     fn on_store(&mut self, reply: Reply) {
-        let remembering = match &mut self.screen {
-            Screen::Session(live) if live.trust == Trust::Remembering => Some(&mut live.trust),
-            _ => None,
-        };
         match reply {
             Reply::Loaded(loaded) => {
                 self.library = match loaded {
@@ -171,19 +170,28 @@ impl Bezel {
                     self.connect(address, username, password);
                 }
             }
-            Reply::Saved(Ok(snapshot)) => {
-                if let Some(trust) = remembering {
-                    *trust = Trust::Verified;
+            Reply::Saved(id, saved) => {
+                let session = match &mut self.screen {
+                    Screen::Session(live) if live.trust == Trust::Remembering(id) => Some(live),
+                    _ => None,
+                };
+                match saved {
+                    Ok(snapshot) => {
+                        if let Some(live) = session {
+                            live.trust = Trust::Verified;
+                        }
+                        self.library = Library::Ready(snapshot);
+                    }
+                    Err(e) => {
+                        self.notice = Some(match session {
+                            Some(live) => {
+                                live.trust = Trust::ThisSession;
+                                format!("The certificate is trusted for this session but was not remembered. {e}")
+                            }
+                            None => format!("A certificate was not remembered. {e}"),
+                        });
+                    }
                 }
-                self.library = Library::Ready(snapshot);
-            }
-            Reply::Saved(Err(e)) => {
-                if let Some(trust) = remembering {
-                    *trust = Trust::ThisSession;
-                }
-                self.notice = Some(format!(
-                    "The certificate is trusted for this session but was not remembered. {e}"
-                ));
             }
         }
     }
@@ -205,13 +213,22 @@ impl Bezel {
     }
 
     pub fn cancel_sign_in(&mut self) {
+        self.waiting = None;
         self.screen = Screen::Idle;
+    }
+
+    /// A sign-in is queued until the Library loads.
+    pub fn is_waiting(&self) -> bool {
+        self.waiting.is_some()
     }
 
     pub fn sign_in(&mut self) {
         let Screen::SignIn(sign_in) = &mut self.screen else {
             return;
         };
+        if self.waiting.is_some() {
+            return;
+        }
         let username = match Username::parse(&sign_in.username.text) {
             Ok(username) => username,
             Err(e) => return sign_in.error = Some(e.to_string()),
@@ -334,17 +351,23 @@ impl Bezel {
     pub fn trust(&mut self) {
         let Some((_, prompt)) = self.prompt() else { return };
         let (host, port) = (prompt.request.host.clone(), prompt.request.port);
-        let remember = match &prompt.request.question {
-            Question::FirstUse(certificate) => prompt.remember.then_some(certificate),
-            Question::Changed { presented, .. } => Some(presented),
+        // The fingerprint the person saw trusted for this host, so the save is refused if the
+        // file holds another by then.
+        let (remember, replacing) = match &prompt.request.question {
+            Question::FirstUse(certificate) => (prompt.remember.then_some(certificate), None),
+            Question::Changed { trusted, presented } => (Some(presented), Some(trusted.sha256)),
         };
-        let change = remember.map(|c| Change::RememberCertificate(TrustedCertificate::new(&host, port, c, today())));
-        prompt.request.trust();
+        let change = remember.map(|c| Change::RememberCertificate {
+            certificate: TrustedCertificate::new(&host, port, c, today()),
+            replacing,
+        });
+        prompt.request.trust(change.is_some());
         let trust = match (change, &self.library, &self.store) {
             (None, ..) => Trust::ThisSession,
             (Some(change), Library::Ready(_), Some(store)) => {
-                store.apply(change);
-                Trust::Remembering
+                self.next_change += 1;
+                store.apply(self.next_change, change);
+                Trust::Remembering(self.next_change)
             }
             (Some(_), Library::Failed(e), _) => {
                 self.notice = Some(format!(

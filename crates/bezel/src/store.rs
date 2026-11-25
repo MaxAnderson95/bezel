@@ -2,7 +2,7 @@
 //! thread.
 
 use std::path::PathBuf;
-use std::sync::mpsc;
+use std::sync::{Arc, mpsc};
 
 use bezel_core::library::{Change, Library, Snapshot};
 use rune::Waker;
@@ -13,35 +13,40 @@ pub enum Loaded {
     Failed(String),
 }
 
+/// Identifies one change, so its reply reaches the request that made it.
+pub type ChangeId = u64;
+
 pub enum Reply {
     Loaded(Loaded),
-    Saved(Result<Snapshot, String>),
+    Saved(ChangeId, Result<Snapshot, String>),
 }
 
 pub struct Store {
-    changes: mpsc::Sender<Change>,
+    changes: mpsc::Sender<(ChangeId, Change)>,
 }
 
 impl Store {
-    /// Opens the Library in the background; replies arrive through `reply`.
-    pub fn open(path: PathBuf, reply: impl Fn(Reply) + Send + 'static, wake: Waker) -> Self {
-        let (changes, receiver) = mpsc::channel::<Change>();
+    /// Opens the Library in the background; replies arrive through `reply`. If the thread can't
+    /// start, the load is reported as failed at once.
+    pub fn open(path: PathBuf, reply: impl Fn(Reply) + Send + Sync + 'static, wake: Waker) -> Self {
+        let send: Arc<dyn Fn(Reply) + Send + Sync> = Arc::new(move |r| {
+            reply(r);
+            wake();
+        });
+        let (changes, receiver) = mpsc::channel::<(ChangeId, Change)>();
+        let worker = send.clone();
         let spawned = std::thread::Builder::new().name("library".into()).spawn(move || {
-            let send = |r| {
-                reply(r);
-                wake();
-            };
             let mut library = match Library::open(&path) {
                 Ok(library) => {
-                    send(Reply::Loaded(Loaded::Ready(library.snapshot())));
+                    worker(Reply::Loaded(Loaded::Ready(library.snapshot())));
                     library
                 }
                 Err(e) => {
                     tracing::error!(error = %e, "library not loaded");
-                    return send(Reply::Loaded(Loaded::Failed(e.to_string())));
+                    return worker(Reply::Loaded(Loaded::Failed(e.to_string())));
                 }
             };
-            for change in receiver {
+            for (id, change) in receiver {
                 let saved = library
                     .apply(change)
                     .map(|()| library.snapshot())
@@ -49,16 +54,19 @@ impl Store {
                 if let Err(e) = &saved {
                     tracing::error!(error = %e, "library not saved");
                 }
-                send(Reply::Saved(saved));
+                worker(Reply::Saved(id, saved));
             }
         });
         if let Err(e) = spawned {
             tracing::error!(error = %e, "library thread not started");
+            send(Reply::Loaded(Loaded::Failed(format!(
+                "Bezel could not open its data: {e}"
+            ))));
         }
         Self { changes }
     }
 
-    pub fn apply(&self, change: Change) {
-        let _ = self.changes.send(change);
+    pub fn apply(&self, id: ChangeId, change: Change) {
+        let _ = self.changes.send((id, change));
     }
 }
