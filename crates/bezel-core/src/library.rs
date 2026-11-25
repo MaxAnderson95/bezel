@@ -273,9 +273,20 @@ pub enum Change {
         connection: ConnectionId,
         group: Option<GroupId>,
     },
+    /// Gives a Connection that asks each time the Credential just saved while signing in to
+    /// `host`:`port`. Nothing changes when the Connection has a Credential by then or reaches
+    /// another host or port: the sign-in was for that endpoint, and a later choice wins.
+    AssignCredential {
+        connection: ConnectionId,
+        credential: CredentialId,
+        host: String,
+        port: u16,
+    },
     AddGroup(Group),
+    /// Refused when the Group's name on disk is no longer `from`, the one the person saw.
     RenameGroup {
         group: GroupId,
+        from: String,
         name: String,
     },
     /// Its Connections become ungrouped.
@@ -553,13 +564,14 @@ impl File {
                     .position(|c| c.item.id == original.id)
                     .ok_or_else(|| gone(&original.name))?;
                 let disk = &self.connections[index].item;
+                let field = Field::new(&original.name);
                 let merged = Connection {
                     id: original.id.clone(),
-                    name: merge(&disk.name, &original.name, edited.name),
-                    host: merge(&disk.host, &original.host, edited.host),
-                    port: merge(&disk.port, &original.port, edited.port),
-                    credential: merge(&disk.credential, &original.credential, edited.credential),
-                    group: merge(&disk.group, &original.group, edited.group),
+                    name: field.merge("name", &disk.name, &original.name, edited.name)?,
+                    host: field.merge("host", &disk.host, &original.host, edited.host)?,
+                    port: field.merge("port", &disk.port, &original.port, edited.port)?,
+                    credential: field.merge("credential", &disk.credential, &original.credential, edited.credential)?,
+                    group: field.merge("group", &disk.group, &original.group, edited.group)?,
                 };
                 self.connections[index].item = self.checked(merged)?;
             }
@@ -575,6 +587,22 @@ impl File {
                     .ok_or_else(|| gone("The connection"))?;
                 entry.item.group = group;
             }
+            Change::AssignCredential {
+                connection,
+                credential,
+                host,
+                port,
+            } => {
+                self.credential(&credential)?;
+                let entry = self.connections.iter_mut().find(|c| c.item.id == connection);
+                if let Some(entry) = entry
+                    && entry.item.credential.is_none()
+                    && entry.item.host.eq_ignore_ascii_case(&host)
+                    && entry.item.port == port
+                {
+                    entry.item.credential = Some(credential);
+                }
+            }
             Change::AddGroup(group) => {
                 let group = Group {
                     name: required(&group.name, "Enter a name for the group")?,
@@ -585,10 +613,11 @@ impl File {
                 }
                 self.groups.push(Entry::new(group));
             }
-            Change::RenameGroup { group, name } => {
+            Change::RenameGroup { group, from, name } => {
                 let name = required(&name, "Enter a name for the group")?;
                 let index = self.group(&group)?;
-                self.groups[index].item.name = name;
+                let item = &mut self.groups[index].item;
+                item.name = Field::new(&from).merge("name", &item.name, &from, name)?;
             }
             Change::DeleteGroup(id) => {
                 self.groups.retain(|g| g.item.id != id);
@@ -640,11 +669,13 @@ impl File {
                         disk.name, disk.username
                     )));
                 }
+                let field = Field::new(&original.name);
                 let name = required(
-                    &merge(&disk.name, &original.name, edited.name),
+                    &field.merge("name", &disk.name, &original.name, edited.name)?,
                     "Enter a name for the credential",
                 )?;
-                let new_username = username(&merge(&disk.username, &original.username, edited.username))?;
+                let new_username =
+                    username(&field.merge("username", &disk.username, &original.username, edited.username)?)?;
                 let item = &mut self.credentials[index].item;
                 item.name = name;
                 item.username = new_username;
@@ -708,9 +739,32 @@ impl File {
     }
 }
 
-/// The edited value where the person changed it, else the value on disk.
-fn merge<T: Clone + PartialEq>(disk: &T, original: &T, edited: T) -> T {
-    if edited == *original { disk.clone() } else { edited }
+/// Merges an edit made from `original`, the item as the person saw it, into the item on disk.
+struct Field<'a> {
+    /// The item's name as the person saw it, for messages.
+    item: &'a str,
+}
+
+impl<'a> Field<'a> {
+    fn new(item: &'a str) -> Self {
+        Self { item }
+    }
+
+    /// The value on disk where the person left the field alone, else the edited value; refused
+    /// when the field was also changed on disk to something else, so neither change is lost
+    /// without the person seeing it.
+    fn merge<T: Clone + PartialEq>(&self, what: &str, disk: &T, original: &T, edited: T) -> Result<T, LibraryError> {
+        if edited == *original {
+            Ok(disk.clone())
+        } else if disk == original || *disk == edited {
+            Ok(edited)
+        } else {
+            Err(LibraryError::Stale(format!(
+                "The {what} of {} was changed elsewhere while it was being edited; check it and save again",
+                self.item
+            )))
+        }
+    }
 }
 
 fn required(value: &str, message: &str) -> Result<String, LibraryError> {
@@ -1346,6 +1400,7 @@ remembered = 2026-10-03
             Change::AddGroup(group("g_new", "")),
             Change::RenameGroup {
                 group: "g_infra".into(),
+                from: "Infrastructure".into(),
                 name: " ".into(),
             },
             Change::AddCredential {
@@ -1385,6 +1440,7 @@ remembered = 2026-10-03
             },
             Change::RenameGroup {
                 group: "g_files".into(),
+                from: "File servers".into(),
                 name: "Files".into(),
             },
             Change::MoveGroup {
@@ -1430,6 +1486,91 @@ remembered = 2026-10-03
         assert_eq!(
             (dc01.name.as_str(), dc01.host.as_str()),
             ("dc01 (primary)", "dc01.new.lan")
+        );
+    }
+
+    #[test]
+    fn edits_to_the_same_field_on_disk_are_refused() {
+        let (_dir, path) = temp_path();
+        let mut library = populated(&path, &MemorySecrets::default());
+        let original = library.snapshot().connection(&"n_dc01".into()).unwrap().clone();
+        let host = |host: &str| Change::EditConnection {
+            original: original.clone(),
+            edited: Connection {
+                host: host.into(),
+                ..original.clone()
+            },
+        };
+        open(&path).apply(host("dc01-b.corp.lan")).unwrap();
+        // The same value as the one on disk is no conflict.
+        library.apply(host("dc01-b.corp.lan")).unwrap();
+        assert!(matches!(
+            library.apply(host("dc01-c.corp.lan")),
+            Err(LibraryError::Stale(_))
+        ));
+        assert_eq!(
+            library.snapshot().connection(&"n_dc01".into()).unwrap().host,
+            "dc01-b.corp.lan"
+        );
+        let rename = |from: &str, name: &str| Change::RenameGroup {
+            group: "g_infra".into(),
+            from: from.into(),
+            name: name.into(),
+        };
+        open(&path).apply(rename("Infrastructure", "Servers")).unwrap();
+        assert!(matches!(
+            library.apply(rename("Infrastructure", "Core")),
+            Err(LibraryError::Stale(_))
+        ));
+        library.apply(rename("Servers", "Core")).unwrap();
+        let edit_username = |username: &str| Change::EditCredential {
+            original: admin(),
+            edited: Credential {
+                username: username.into(),
+                ..admin()
+            },
+            password: None,
+            today: date!(2026 - 11 - 25),
+        };
+        open(&path).apply(edit_username(r"CORP\bob")).unwrap();
+        assert!(matches!(
+            library.apply(edit_username(r"CORP\carol")),
+            Err(LibraryError::Stale(_))
+        ));
+    }
+
+    #[test]
+    fn a_credential_is_assigned_only_to_the_endpoint_that_asked() {
+        let (_dir, path) = temp_path();
+        let mut library = populated(&path, &MemorySecrets::default());
+        let lab = ConnectionId::from("n_lab");
+        let assign = |host: &str| Change::AssignCredential {
+            connection: lab.clone(),
+            credential: "c_admin".into(),
+            host: host.into(),
+            port: 3389,
+        };
+        // The host changed after the sign-in began: nothing is assigned.
+        library.apply(assign("old-lab.corp.lan")).unwrap();
+        assert_eq!(library.snapshot().connection(&lab).unwrap().credential, None);
+        library.apply(assign("LAB.corp.lan")).unwrap();
+        assert_eq!(
+            library.snapshot().connection(&lab).unwrap().credential,
+            Some("c_admin".into())
+        );
+        // A Credential chosen since wins.
+        library.apply(add_credential("c_other", "Other", "pw")).unwrap();
+        library
+            .apply(Change::AssignCredential {
+                connection: lab.clone(),
+                credential: "c_other".into(),
+                host: "lab.corp.lan".into(),
+                port: 3389,
+            })
+            .unwrap();
+        assert_eq!(
+            library.snapshot().connection(&lab).unwrap().credential,
+            Some("c_admin".into())
         );
     }
 
