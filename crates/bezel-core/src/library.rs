@@ -13,7 +13,7 @@ use time::Date;
 
 use crate::address::{Address, DEFAULT_PORT};
 use crate::keys::CommandKey;
-use crate::secrets::{Secret, Secrets};
+use crate::secrets::{Secret, Secrets, SecretsError};
 use crate::trust::{Fingerprint, TrustedCertificate};
 use crate::usernames::Username;
 
@@ -252,14 +252,22 @@ pub enum Change {
         certificate: TrustedCertificate,
         replacing: Option<Fingerprint>,
     },
+    /// Forgets the Trusted certificate for that host and port, refused if the file holds one
+    /// other than `sha256`, the one the person saw.
     ForgetCertificate {
         host: String,
         port: u16,
+        sha256: Fingerprint,
     },
     /// Its Credential and Group must exist.
     AddConnection(Connection),
-    /// Replaces the Connection with the same ID, which must still exist.
-    EditConnection(Connection),
+    /// Changes the fields where `edited` differs from `original`, the Connection as the person
+    /// saw it, and keeps the others as they are on disk, so an edit made meanwhile elsewhere
+    /// survives. The Connection must still exist.
+    EditConnection {
+        original: Connection,
+        edited: Connection,
+    },
     DeleteConnection(ConnectionId),
     MoveConnection {
         connection: ConnectionId,
@@ -282,13 +290,14 @@ pub enum Change {
         credential: Credential,
         password: Secret,
     },
-    /// Changes what is given and keeps the rest as it is on disk. A new password is stored
-    /// first and dates the Credential's `password_updated` to `today`; every Connection using
-    /// the Credential signs in with it from then on.
+    /// Changes the name and username where `edited` differs from `original`, the Credential as
+    /// the person saw it, and keeps the rest as it is on disk. A new password dates the
+    /// Credential's `password_updated` to `today`, and every Connection using the Credential
+    /// signs in with it from then on; it is refused if the username on disk is no longer the
+    /// one the person saw, as the password was typed for that account.
     EditCredential {
-        credential: CredentialId,
-        name: Option<String>,
-        username: Option<String>,
+        original: Credential,
+        edited: Credential,
         password: Option<Secret>,
         today: Date,
     },
@@ -319,7 +328,15 @@ pub enum LibraryError {
     #[error("{0}")]
     Invalid(String),
     #[error("The Keychain refused: {0}")]
-    Secrets(#[from] crate::secrets::SecretsError),
+    Secrets(#[from] SecretsError),
+    /// The change failed, and putting the Keychain back as it was failed too, leaving the
+    /// Credential's item out of step with the file.
+    #[error("{error}. The Keychain item for credential {credential} could not be put back as it was: {restore}")]
+    Restore {
+        error: Box<LibraryError>,
+        credential: CredentialId,
+        restore: SecretsError,
+    },
 }
 
 pub struct Library {
@@ -367,38 +384,50 @@ impl Library {
     /// `Conflict`) and the Library takes the file as it is, so the next decision is made on
     /// current data. A file that no longer parses is refused rather than overwritten.
     ///
-    /// On any error the file is left as it was, with two exceptions where the Keychain and the
-    /// file can't change together: a new password stays stored when the file then fails to
-    /// save its date, and deleting a Credential saves the file before removing its password,
-    /// so a Keychain failure there leaves an unused item behind.
+    /// On any error the file and the Keychain are left as they were and the Library takes the
+    /// file as it is on disk. A change to a password reaches the Keychain before the file is
+    /// saved; if the save then fails, the previous password is put back, and a failure to put
+    /// it back is reported with the Credential's ID (`Restore`).
     pub fn apply(&mut self, change: Change) -> Result<(), LibraryError> {
         let _lock = lock(&self.path)?;
         let disk = read(&self.path)?;
         let mut file = disk.clone();
-        let secret = match file.change(change) {
-            Ok(secret) => secret,
+        match file.change(change).and_then(|password| self.save(&file, password)) {
+            Ok(()) => {
+                self.file = file;
+                Ok(())
+            }
             Err(e) => {
                 self.file = disk;
-                return Err(e);
+                Err(e)
             }
+        }
+    }
+
+    /// Sets the Credential's password as the change asks, then saves the file, putting the
+    /// previous password back if the save fails.
+    fn save(&self, file: &File, password: PasswordChange) -> Result<(), LibraryError> {
+        let Some((id, password)) = password else {
+            return save(&self.path, file);
         };
-        if let SecretStep::Add(id, password) | SecretStep::Replace(id, password) = &secret
-            && let Err(e) = self.secrets.write(id, password)
-        {
-            self.file = disk;
-            return Err(e.into());
-        }
-        if let Err(e) = save(&self.path, &file) {
-            if let SecretStep::Add(id, _) = &secret {
-                let _ = self.secrets.delete(id);
-            }
-            return Err(e);
-        }
-        self.file = file;
-        if let SecretStep::Delete(id) = &secret {
-            self.secrets.delete(id)?;
-        }
-        Ok(())
+        let previous = self.secrets.read(&id)?;
+        set(&*self.secrets, &id, password.as_ref())?;
+        save(&self.path, file).map_err(|error| match set(&*self.secrets, &id, previous.as_ref()) {
+            Ok(()) => error,
+            Err(restore) => LibraryError::Restore {
+                error: Box::new(error),
+                credential: id,
+                restore,
+            },
+        })
+    }
+}
+
+/// Stores the password for the Credential, or removes it for `None`.
+fn set(secrets: &dyn Secrets, id: &CredentialId, password: Option<&Secret>) -> Result<(), SecretsError> {
+    match password {
+        Some(password) => secrets.write(id, password),
+        None => secrets.delete(id),
     }
 }
 
@@ -472,21 +501,13 @@ struct Precise {
     trusted_certificates: Vec<TrustedCertificate>,
 }
 
-/// What a change needs from the `Secrets` store around saving the file.
-enum SecretStep {
-    None,
-    /// Stored before the file is saved, and removed again if the save fails.
-    Add(CredentialId, Secret),
-    /// Stored before the file is saved.
-    Replace(CredentialId, Secret),
-    /// Removed after the file is saved.
-    Delete(CredentialId),
-}
+/// A Credential whose password a change stores (`Some`) or removes (`None`).
+type PasswordChange = Option<(CredentialId, Option<Secret>)>;
 
 impl File {
     /// Applies the change after checking it against what this file holds. A refusal may come
     /// part way through, so the caller discards a file this refused.
-    fn change(&mut self, change: Change) -> Result<SecretStep, LibraryError> {
+    fn change(&mut self, change: Change) -> Result<PasswordChange, LibraryError> {
         match change {
             Change::RememberCertificate { certificate, replacing } => {
                 let on_disk = self
@@ -500,12 +521,23 @@ impl File {
                         port: certificate.port,
                     });
                 }
-                self.trusted_certificates
-                    .retain(|t| !t.item.is_for(&certificate.host, certificate.port));
-                self.trusted_certificates.push(Entry::new(certificate));
+                let existing = self
+                    .trusted_certificates
+                    .iter_mut()
+                    .find(|t| t.item.is_for(&certificate.host, certificate.port));
+                match existing {
+                    Some(entry) => entry.item = certificate,
+                    None => self.trusted_certificates.push(Entry::new(certificate)),
+                }
             }
-            Change::ForgetCertificate { host, port } => {
-                self.trusted_certificates.retain(|t| !t.item.is_for(&host, port))
+            Change::ForgetCertificate { host, port, sha256 } => {
+                let on_disk = self.trusted_certificates.iter().find(|t| t.item.is_for(&host, port));
+                if on_disk.is_some_and(|t| t.item.sha256 != sha256) {
+                    return Err(LibraryError::Stale(format!(
+                        "The certificate for {host}:{port} was replaced since the list was shown, so Bezel kept it"
+                    )));
+                }
+                self.trusted_certificates.retain(|t| !t.item.is_for(&host, port));
             }
             Change::AddConnection(connection) => {
                 let connection = self.checked(connection)?;
@@ -514,15 +546,22 @@ impl File {
                 }
                 self.connections.push(Entry::new(connection));
             }
-            Change::EditConnection(connection) => {
-                let connection = self.checked(connection)?;
-                let name = connection.name.clone();
-                let entry = self
+            Change::EditConnection { original, edited } => {
+                let index = self
                     .connections
-                    .iter_mut()
-                    .find(|c| c.item.id == connection.id)
-                    .ok_or_else(|| gone(&name))?;
-                entry.item = connection;
+                    .iter()
+                    .position(|c| c.item.id == original.id)
+                    .ok_or_else(|| gone(&original.name))?;
+                let disk = &self.connections[index].item;
+                let merged = Connection {
+                    id: original.id.clone(),
+                    name: merge(&disk.name, &original.name, edited.name),
+                    host: merge(&disk.host, &original.host, edited.host),
+                    port: merge(&disk.port, &original.port, edited.port),
+                    credential: merge(&disk.credential, &original.credential, edited.credential),
+                    group: merge(&disk.group, &original.group, edited.group),
+                };
+                self.connections[index].item = self.checked(merged)?;
             }
             Change::DeleteConnection(id) => self.connections.retain(|c| c.item.id != id),
             Change::MoveConnection { connection, group } => {
@@ -565,7 +604,7 @@ impl File {
                     self.group(before)?;
                 }
                 if before.as_ref() == Some(&group) {
-                    return Ok(SecretStep::None);
+                    return Ok(None);
                 }
                 let entry = self.groups.remove(from);
                 let to = match &before {
@@ -585,30 +624,33 @@ impl File {
                 }
                 let id = credential.id.clone();
                 self.credentials.push(Entry::new(credential));
-                return Ok(SecretStep::Add(id, password));
+                return Ok(Some((id, Some(password))));
             }
             Change::EditCredential {
-                credential,
-                name,
-                username: new_username,
+                original,
+                edited,
                 password,
                 today,
             } => {
-                let name = name
-                    .map(|n| required(&n, "Enter a name for the credential"))
-                    .transpose()?;
-                let new_username = new_username.map(|u| username(&u)).transpose()?;
-                let index = self.credential(&credential)?;
+                let index = self.credential(&original.id)?;
+                let disk = &self.credentials[index].item;
+                if password.is_some() && disk.username != original.username {
+                    return Err(LibraryError::Stale(format!(
+                        "The username of {} changed to {} while the new password was typed, so the password was not saved",
+                        disk.name, disk.username
+                    )));
+                }
+                let name = required(
+                    &merge(&disk.name, &original.name, edited.name),
+                    "Enter a name for the credential",
+                )?;
+                let new_username = username(&merge(&disk.username, &original.username, edited.username))?;
                 let item = &mut self.credentials[index].item;
-                if let Some(name) = name {
-                    item.name = name;
-                }
-                if let Some(username) = new_username {
-                    item.username = username;
-                }
+                item.name = name;
+                item.username = new_username;
                 if let Some(password) = password {
                     item.password_updated = Some(today);
-                    return Ok(SecretStep::Replace(credential, password));
+                    return Ok(Some((original.id, Some(password))));
                 }
             }
             Change::DeleteCredential(id) => {
@@ -618,11 +660,11 @@ impl File {
                         connection.item.credential = None;
                     }
                 }
-                return Ok(SecretStep::Delete(id));
+                return Ok(Some((id, None)));
             }
             Change::Settings(settings) => self.settings.item = settings,
         }
-        Ok(SecretStep::None)
+        Ok(None)
     }
 
     /// The Connection with its text trimmed, once its fields are valid and the Credential and
@@ -664,6 +706,11 @@ impl File {
             .position(|c| &c.item.id == id)
             .ok_or_else(|| gone("The credential"))
     }
+}
+
+/// The edited value where the person changed it, else the value on disk.
+fn merge<T: Clone + PartialEq>(disk: &T, original: &T, edited: T) -> T {
+    if edited == *original { disk.clone() } else { edited }
 }
 
 fn required(value: &str, message: &str) -> Result<String, LibraryError> {
@@ -884,6 +931,65 @@ mod tests {
         }
     }
 
+    fn admin() -> Credential {
+        credential("c_admin", "Domain admin")
+    }
+
+    /// The password typed for the Credential as the person saw it.
+    fn new_password(original: Credential, password: &str) -> Change {
+        Change::EditCredential {
+            edited: original.clone(),
+            original,
+            password: Some(Secret::from(password.to_owned())),
+            today: date!(2026 - 11 - 25),
+        }
+    }
+
+    /// Makes every save fail by putting a folder where Bezel writes its temporary file.
+    #[must_use]
+    fn block_saves(path: &Path) -> PathBuf {
+        let blocker = path.with_file_name(format!("bezel.toml.{}.tmp", std::process::id()));
+        fs::create_dir_all(&blocker).unwrap();
+        blocker
+    }
+
+    /// `MemorySecrets` that refuses the operations named.
+    #[derive(Clone, Default)]
+    struct Refusing {
+        inner: MemorySecrets,
+        refused: std::sync::Arc<std::sync::Mutex<Vec<&'static str>>>,
+    }
+
+    impl Refusing {
+        fn refuse(&self, operation: &'static str) {
+            self.refused.lock().unwrap().push(operation);
+        }
+
+        fn check(&self, operation: &str) -> Result<(), SecretsError> {
+            match self.refused.lock().unwrap().contains(&operation) {
+                true => Err(SecretsError(format!("{operation} denied"))),
+                false => Ok(()),
+            }
+        }
+    }
+
+    impl Secrets for Refusing {
+        fn read(&self, credential: &CredentialId) -> Result<Option<Secret>, SecretsError> {
+            self.check("read")?;
+            self.inner.read(credential)
+        }
+
+        fn write(&self, credential: &CredentialId, secret: &Secret) -> Result<(), SecretsError> {
+            self.check("write")?;
+            self.inner.write(credential, secret)
+        }
+
+        fn delete(&self, credential: &CredentialId) -> Result<(), SecretsError> {
+            self.check("delete")?;
+            self.inner.delete(credential)
+        }
+    }
+
     fn add_credential(id: &str, name: &str, password: &str) -> Change {
         Change::AddCredential {
             credential: credential(id, name),
@@ -1068,15 +1174,7 @@ remembered = 2026-10-03
         let secrets = MemorySecrets::default();
         let mut library = populated(&path, &secrets);
         let id = CredentialId::from("c_admin");
-        library
-            .apply(Change::EditCredential {
-                credential: id.clone(),
-                name: None,
-                username: None,
-                password: Some(Secret::from("correct horse".to_owned())),
-                today: date!(2026 - 11 - 25),
-            })
-            .unwrap();
+        library.apply(new_password(admin(), "correct horse")).unwrap();
         let snapshot = open(&path).snapshot();
         let users: Vec<&str> = snapshot.used_by(&id).iter().map(|c| c.name.as_str()).collect();
         assert_eq!(users, ["DC01", "dc02"]);
@@ -1094,19 +1192,59 @@ remembered = 2026-10-03
     fn editing_a_credential_keeps_what_was_not_changed() {
         let (_dir, path) = temp_path();
         let mut library = populated(&path, &MemorySecrets::default());
+        // Another Bezel changes the username after this one showed the Credential.
+        open(&path)
+            .apply(Change::EditCredential {
+                original: admin(),
+                edited: Credential {
+                    username: r"CORP\max".into(),
+                    ..admin()
+                },
+                password: None,
+                today: date!(2026 - 11 - 25),
+            })
+            .unwrap();
         library
             .apply(Change::EditCredential {
-                credential: "c_admin".into(),
-                name: Some("  Admin ".into()),
-                username: None,
+                original: admin(),
+                edited: Credential {
+                    name: "  Admin ".into(),
+                    ..admin()
+                },
                 password: None,
                 today: date!(2026 - 11 - 25),
             })
             .unwrap();
         let credential = library.snapshot().credentials[0].clone();
         assert_eq!(credential.name, "Admin");
-        assert_eq!(credential.username, r"CORP\admin.max");
+        assert_eq!(credential.username, r"CORP\max");
         assert_eq!(credential.password_updated, Some(date!(2026 - 08 - 23)));
+    }
+
+    #[test]
+    fn a_new_password_is_refused_when_the_username_changed_meanwhile() {
+        let (_dir, path) = temp_path();
+        let secrets = MemorySecrets::default();
+        let mut library = populated(&path, &secrets);
+        let mut other = open(&path);
+        let bob = Credential {
+            username: r"CORP\bob".into(),
+            ..admin()
+        };
+        other
+            .apply(Change::EditCredential {
+                original: admin(),
+                edited: bob.clone(),
+                password: None,
+                today: date!(2026 - 11 - 25),
+            })
+            .unwrap();
+        assert!(matches!(
+            library.apply(new_password(admin(), "alice's")),
+            Err(LibraryError::Stale(_))
+        ));
+        assert_eq!(secrets.get(&"c_admin".into()), Some(Secret::from("hunter2".to_owned())));
+        assert_eq!(library.snapshot().credentials[0].username, bob.username);
     }
 
     #[test]
@@ -1172,10 +1310,11 @@ remembered = 2026-10-03
                 group: Some("g_files".into()),
             })
             .unwrap();
+        let original = library.snapshot().connection(&"n_dc01".into()).unwrap().clone();
         let mut edited = connection("n_dc01", " dc01 ", None, None);
         edited.host = " dc01.corp.lan ".into();
         edited.port = 3390;
-        library.apply(Change::EditConnection(edited)).unwrap();
+        library.apply(Change::EditConnection { original, edited }).unwrap();
         let snapshot = open(&path).snapshot();
         assert_eq!(
             snapshot.connection(&"n_lab".into()).unwrap().group,
@@ -1235,7 +1374,10 @@ remembered = 2026-10-03
         other.apply(Change::DeleteGroup("g_files".into())).unwrap();
         let on_disk = fs::read_to_string(&path).unwrap();
         for change in [
-            Change::EditConnection(connection("n_dc01", "dc01", None, None)),
+            Change::EditConnection {
+                original: connection("n_dc01", "DC01", Some("c_admin"), Some("g_infra")),
+                edited: connection("n_dc01", "dc01", None, None),
+            },
             Change::AddConnection(connection("n_new", "new", Some("c_admin"), None)),
             Change::MoveConnection {
                 connection: "n_lab".into(),
@@ -1249,13 +1391,7 @@ remembered = 2026-10-03
                 group: "g_infra".into(),
                 before: Some("g_files".into()),
             },
-            Change::EditCredential {
-                credential: "c_admin".into(),
-                name: None,
-                username: None,
-                password: Some(Secret::from("new".to_owned())),
-                today: date!(2026 - 11 - 25),
-            },
+            new_password(admin(), "new"),
         ] {
             assert!(
                 matches!(stale.apply(change.clone()), Err(LibraryError::Stale(_))),
@@ -1267,20 +1403,98 @@ remembered = 2026-10-03
     }
 
     #[test]
-    fn a_credential_whose_file_save_fails_leaves_no_password_behind() {
-        let (dir, _) = temp_path();
-        // A directory where the file should be makes the rename fail.
-        let path = dir.path().join("bezel.toml");
-        let secrets = MemorySecrets::default();
-        let mut library = Library::open(&path, secrets.clone()).unwrap();
-        fs::create_dir_all(&path).unwrap();
-        assert!(
-            library
-                .apply(add_credential("c_admin", "Domain admin", "hunter2"))
-                .is_err()
+    fn edits_keep_fields_changed_on_disk_that_the_person_did_not_touch() {
+        let (_dir, path) = temp_path();
+        let mut library = populated(&path, &MemorySecrets::default());
+        let original = library.snapshot().connection(&"n_dc01".into()).unwrap().clone();
+        let mut other = open(&path);
+        other
+            .apply(Change::EditConnection {
+                original: original.clone(),
+                edited: Connection {
+                    host: "dc01.new.lan".into(),
+                    ..original.clone()
+                },
+            })
+            .unwrap();
+        library
+            .apply(Change::EditConnection {
+                original: original.clone(),
+                edited: Connection {
+                    name: "dc01 (primary)".into(),
+                    ..original
+                },
+            })
+            .unwrap();
+        let dc01 = open(&path).snapshot().connection(&"n_dc01".into()).unwrap().clone();
+        assert_eq!(
+            (dc01.name.as_str(), dc01.host.as_str()),
+            ("dc01 (primary)", "dc01.new.lan")
         );
-        assert_eq!(secrets.get(&"c_admin".into()), None);
-        assert!(library.snapshot().credentials.is_empty());
+    }
+
+    #[test]
+    fn a_credential_whose_file_save_fails_leaves_no_password_behind() {
+        let (_dir, path) = temp_path();
+        let secrets = MemorySecrets::default();
+        let mut library = populated(&path, &secrets);
+        let _blocked = block_saves(&path);
+        assert!(matches!(
+            library.apply(add_credential("c_new", "New", "fresh")),
+            Err(LibraryError::Write { .. })
+        ));
+        assert_eq!(secrets.get(&"c_new".into()), None);
+        assert_eq!(library.snapshot().credentials.len(), 1);
+    }
+
+    #[test]
+    fn a_failed_save_puts_the_previous_password_back() {
+        let (_dir, path) = temp_path();
+        let secrets = MemorySecrets::default();
+        let mut library = populated(&path, &secrets);
+        let _blocked = block_saves(&path);
+        assert!(library.apply(new_password(admin(), "new")).is_err());
+        assert!(library.apply(Change::DeleteCredential("c_admin".into())).is_err());
+        assert_eq!(secrets.get(&"c_admin".into()), Some(Secret::from("hunter2".to_owned())));
+        assert_eq!(library.snapshot().credentials, vec![admin()]);
+    }
+
+    #[test]
+    fn a_refused_keychain_deletion_keeps_the_credential() {
+        let (_dir, path) = temp_path();
+        let secrets = Refusing::default();
+        let mut library = populated(&path, &secrets.inner);
+        library.secrets = Box::new(secrets.clone());
+        secrets.refuse("delete");
+        assert!(matches!(
+            library.apply(Change::DeleteCredential("c_admin".into())),
+            Err(LibraryError::Secrets(_))
+        ));
+        let snapshot = open(&path).snapshot();
+        assert_eq!(snapshot.credentials, vec![admin()]);
+        assert_eq!(snapshot.used_by(&"c_admin".into()).len(), 2);
+        assert_eq!(library.snapshot(), snapshot);
+        assert_eq!(
+            secrets.inner.get(&"c_admin".into()),
+            Some(Secret::from("hunter2".to_owned()))
+        );
+    }
+
+    #[test]
+    fn a_password_that_cannot_be_put_back_is_reported_with_its_credential() {
+        let (_dir, path) = temp_path();
+        let secrets = Refusing::default();
+        let mut library = populated(&path, &secrets.inner);
+        library.secrets = Box::new(secrets.clone());
+        let _blocked = block_saves(&path);
+        secrets.refuse("delete");
+        let error = library.apply(add_credential("c_new", "New", "fresh")).unwrap_err();
+        assert!(matches!(&error, LibraryError::Restore { credential, .. } if credential.as_str() == "c_new"));
+        let message = error.to_string();
+        assert!(
+            message.contains("could not be saved") && message.contains("c_new"),
+            "{message}"
+        );
     }
 
     #[test]
@@ -1294,11 +1508,15 @@ remembered = 2026-10-03
         .unwrap();
         let mut library = open(&path);
         assert_eq!(library.snapshot().settings.appearance, Appearance::Dark);
+        let original = library.snapshot().connections[0].clone();
         library
-            .apply(Change::EditConnection(Connection {
-                name: "dc01 (primary)".into(),
-                ..library.snapshot().connections[0].clone()
-            }))
+            .apply(Change::EditConnection {
+                edited: Connection {
+                    name: "dc01 (primary)".into(),
+                    ..original.clone()
+                },
+                original,
+            })
             .unwrap();
         library
             .apply(Change::Settings(Settings {
@@ -1307,7 +1525,26 @@ remembered = 2026-10-03
             }))
             .unwrap();
         library.apply(remember(trusted("fs01.corp.lan", 1))).unwrap();
+        let text = fs::read_to_string(&path).unwrap().replace(
+            "[[trusted_certificates]]\n",
+            "[[trusted_certificates]]\nnote = \"pinned by hand\"\n",
+        );
+        fs::write(&path, text).unwrap();
+        library
+            .apply(Change::RememberCertificate {
+                certificate: trusted("fs01.corp.lan", 2),
+                replacing: Some(trusted("fs01.corp.lan", 1).sha256),
+            })
+            .unwrap();
         let saved: toml::Table = toml::from_str(&fs::read_to_string(&path).unwrap()).unwrap();
+        assert_eq!(
+            saved["trusted_certificates"][0]["note"].as_str(),
+            Some("pinned by hand")
+        );
+        assert_eq!(
+            saved["trusted_certificates"][0]["sha256"].as_str(),
+            Some(trusted("fs01.corp.lan", 2).sha256.to_string().as_str())
+        );
         assert_eq!(saved["settings"]["future"].as_integer(), Some(1));
         assert_eq!(saved["settings"]["remember_certificates"].as_bool(), Some(true));
         let dc01 = &saved["connections"][0];
@@ -1376,13 +1613,16 @@ remembered = 2026-10-03
         let (_dir, path) = temp_path();
         let mut library = open(&path);
         library.apply(remember(trusted("fs01.corp.lan", 1))).unwrap();
-        library
-            .apply(Change::ForgetCertificate {
-                host: "fs01.corp.lan".into(),
-                port: 3389,
-            })
-            .unwrap();
+        let forget = |fill| Change::ForgetCertificate {
+            host: "fs01.corp.lan".into(),
+            port: 3389,
+            sha256: trusted("fs01.corp.lan", fill).sha256,
+        };
+        // The list showed a certificate another Bezel has since replaced.
+        assert!(matches!(library.apply(forget(2)), Err(LibraryError::Stale(_))));
+        library.apply(forget(1)).unwrap();
         assert!(open(&path).snapshot().trusted_certificates.is_empty());
+        library.apply(forget(1)).unwrap();
     }
 
     #[test]
