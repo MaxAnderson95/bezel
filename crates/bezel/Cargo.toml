@@ -1,0 +1,22 @@
+[package]
+name = "bezel"
+description = "Bezel, an RDP client for the Mac."
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+publish.workspace = true
+
+[lints]
+workspace = true
+
+[dependencies]
+bezel-core.workspace = true
+bezel-rdp.workspace = true
+png.workspace = true
+rune.workspace = true
+rune-kit.workspace = true
+rune-theme-opencode.workspace = true
+time.workspace = true
+tracing.workspace = true
+tracing-appender.workspace = true
+tracing-subscriber.workspace = true
