@@ -3,7 +3,7 @@
 
 use bezel_core::library::CredentialId;
 use bezel_core::secrets::{Secret, Secrets, SecretsError};
-use rune::credentials::{CredentialError, Credentials};
+use rune::credentials::Credentials;
 
 /// Rune keeps one item per service, so each Credential has a service of its own: this prefix,
 /// a dot and the Credential ID, with the ID as the account too.
@@ -21,28 +21,32 @@ fn service(credential: &CredentialId) -> String {
     format!("{SERVICE}.{credential}")
 }
 
-fn error(e: CredentialError) -> SecretsError {
-    SecretsError(e.to_string())
+/// Names the Keychain item, so a failure can be found and fixed in Keychain Access.
+fn error(service: &str, e: impl std::fmt::Display) -> SecretsError {
+    SecretsError(format!("{service}: {e}"))
 }
 
 impl Secrets for Keychain {
     fn read(&self, credential: &CredentialId) -> Result<Option<Secret>, SecretsError> {
-        let Some(found) = self.0.read(&service(credential)).map_err(error)? else {
+        let service = service(credential);
+        let Some(found) = self.0.read(&service).map_err(|e| error(&service, e))? else {
             return Ok(None);
         };
         String::from_utf8(found.secret().to_vec())
             .map(|password| Some(Secret::from(password)))
-            .map_err(|_| SecretsError("the stored password is not text".into()))
+            .map_err(|_| error(&service, "the stored password is not text"))
     }
 
     fn write(&self, credential: &CredentialId, secret: &Secret) -> Result<(), SecretsError> {
+        let service = service(credential);
         self.0
-            .write(&service(credential), credential.as_str(), secret.expose().as_bytes())
-            .map_err(error)
+            .write(&service, credential.as_str(), secret.expose().as_bytes())
+            .map_err(|e| error(&service, e))
     }
 
     fn delete(&self, credential: &CredentialId) -> Result<(), SecretsError> {
-        self.0.delete(&service(credential)).map_err(error)
+        let service = service(credential);
+        self.0.delete(&service).map_err(|e| error(&service, e))
     }
 }
 
