@@ -8,7 +8,7 @@ use rune::{Cx, El, Phase as DragPhase, PointerButton, Tx, col, el, icon, row, te
 use rune_kit::{Button, ButtonVariant, Checkbox, ControlSize, Dialog, Field, Kit, Spinner, TextInput};
 use rune_theme_opencode::icons;
 
-use crate::app::{Bezel, Library, Live, Phase, Prompt, Screen, SignIn};
+use crate::app::{Bezel, Library, Live, Phase, Prompt, Screen, SignIn, Trust};
 use crate::pointer;
 
 const TITLEBAR: f32 = 40.0;
@@ -27,9 +27,22 @@ pub fn view(s: &Bezel, cx: &mut Cx<Bezel>) -> El {
         }
         Screen::Session(live) => {
             if let Some(prompt) = &live.certificate {
-                certificate_dialog(prompt, k, &mut layer);
+                certificate_dialog(prompt, k, &s.library, &mut layer);
             }
-            session(s, live, k, scale)
+            let mut stage = col().w_full().h_full().child(session(s, live, k, scale));
+            if let Some(message) = &s.notice {
+                stage = stage.child(
+                    col().absolute(16.0, 16.0).w(420.0).child(
+                        notice(k, message, "", false).child(
+                            Button::new("Dismiss")
+                                .control_size(ControlSize::Small)
+                                .on_press(Bezel::dismiss_notice)
+                                .build(k),
+                        ),
+                    ),
+                );
+            }
+            stage
         }
     };
     let area = col()
@@ -95,7 +108,7 @@ fn titlebar(s: &Bezel, k: &Kit, inset: f32) -> El {
         )
         .child(text(live.username.clone()).font(k.ty.ui).color(k.c.text_muted))
         .child(text(state).font(k.ty.ui).color(k.c.text_muted));
-    if matches!(live.state, Phase::Connected { .. }) && !live.trusted_once {
+    if matches!(live.state, Phase::Connected { .. }) && live.trust == Trust::Verified {
         bar = bar.child(
             row()
                 .gap(4.0)
@@ -291,8 +304,11 @@ fn buttons(secondary: El, primary: El) -> El {
         .child(primary)
 }
 
-fn certificate_dialog(prompt: &Prompt, k: &Kit, layer: &mut Vec<El>) {
+fn certificate_dialog(prompt: &Prompt, k: &Kit, library: &Library, layer: &mut Vec<El>) {
     let host = &prompt.request.host;
+    // Without its saved certificates Bezel can't tell a new certificate from a changed one,
+    // and can't save one either.
+    let unreadable = matches!(library, Library::Failed(_));
     let dialog = match &prompt.request.question {
         Question::FirstUse(certificate) => {
             let body = col()
@@ -304,6 +320,12 @@ fn certificate_dialog(prompt: &Prompt, k: &Kit, layer: &mut Vec<El>) {
                 .child(
                     Checkbox::new(prompt.remember)
                         .label("Remember this certificate")
+                        .description(if unreadable {
+                            "Bezel can't read its saved certificates, so it can't tell whether this one changed or remember it"
+                        } else {
+                            ""
+                        })
+                        .disabled(unreadable)
                         .on_toggle(Bezel::toggle_remember)
                         .build(k)
                         .key("certificate-remember"),

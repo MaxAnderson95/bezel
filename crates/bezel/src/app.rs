@@ -11,7 +11,7 @@ use bezel_core::usernames::Username;
 use bezel_rdp::{Auth, CertificateRequest, Ended, Event, Input, Pointer, Session, SessionHandle, State, Target, View};
 use rune::{PhysicalInput, TextEdit, Tx, Waker};
 
-use crate::keymap;
+use crate::keymap::{self, Translated};
 use crate::platform;
 use crate::store::{Loaded, Reply, Store};
 
@@ -32,6 +32,11 @@ pub struct Bezel {
     pub notice: Option<String>,
     next_session: u64,
     last_username: String,
+    /// A sign-in waiting for the Library to load, so its Trusted certificate is known before
+    /// the Session decides whether a certificate is new or changed.
+    waiting: Option<(Address, Username, String)>,
+    /// The app menu's Hide shortcuts no longer claim ⌘H and ⌥⌘H.
+    menus_ready: bool,
 }
 
 pub enum Library {
@@ -67,9 +72,19 @@ pub struct Live {
     pub state: Phase,
     pub pointer: Pointer,
     pub certificate: Option<Prompt>,
-    /// The certificate was trusted for this Session only, rather than by the Mac's chain or a
-    /// Trusted certificate, so the status line doesn't say "Trusted".
-    pub trusted_once: bool,
+    pub trust: Trust,
+}
+
+/// How this Session's certificate came to be accepted. The status line says "Trusted" only for
+/// `Verified`.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Trust {
+    /// The Mac's chain or a Trusted certificate.
+    Verified,
+    /// Trusted for this Session only, by choice or because remembering it failed.
+    ThisSession,
+    /// Trusted, and waiting for the Library to confirm it saved the Trusted certificate.
+    Remembering,
 }
 
 #[derive(Clone, Copy, PartialEq, Eq)]
@@ -110,6 +125,8 @@ impl Bezel {
             notice: None,
             next_session: 0,
             last_username: String::new(),
+            waiting: None,
+            menus_ready: false,
         }
     }
 
@@ -125,6 +142,9 @@ impl Bezel {
 
     /// Runs before every frame; true when something changed.
     pub fn poll(&mut self, _clock: f64, _tx: &mut Tx) -> bool {
+        if !self.menus_ready {
+            self.menus_ready = platform::release_hide_shortcuts();
+        }
         let mut changed = false;
         while let Ok(message) = self.inbox.try_recv() {
             changed = true;
@@ -137,15 +157,33 @@ impl Bezel {
     }
 
     fn on_store(&mut self, reply: Reply) {
+        let remembering = match &mut self.screen {
+            Screen::Session(live) if live.trust == Trust::Remembering => Some(&mut live.trust),
+            _ => None,
+        };
         match reply {
-            Reply::Loaded(Loaded::Ready(snapshot)) | Reply::Saved(Ok(snapshot)) => {
-                self.library = Library::Ready(snapshot)
+            Reply::Loaded(loaded) => {
+                self.library = match loaded {
+                    Loaded::Ready(snapshot) => Library::Ready(snapshot),
+                    Loaded::Failed(e) => Library::Failed(e),
+                };
+                if let Some((address, username, password)) = self.waiting.take() {
+                    self.connect(address, username, password);
+                }
             }
-            Reply::Loaded(Loaded::Failed(e)) => self.library = Library::Failed(e),
+            Reply::Saved(Ok(snapshot)) => {
+                if let Some(trust) = remembering {
+                    *trust = Trust::Verified;
+                }
+                self.library = Library::Ready(snapshot);
+            }
             Reply::Saved(Err(e)) => {
+                if let Some(trust) = remembering {
+                    *trust = Trust::ThisSession;
+                }
                 self.notice = Some(format!(
-                    "The certificate is trusted for now but was not remembered. {e}"
-                ))
+                    "The certificate is trusted for this session but was not remembered. {e}"
+                ));
             }
         }
     }
@@ -182,7 +220,10 @@ impl Bezel {
         let password = sign_in.password.text.clone();
         sign_in.password.clear();
         self.last_username = username.to_string();
-        self.connect(address, username, password);
+        match self.library {
+            Library::Loading => self.waiting = Some((address, username, password)),
+            Library::Ready(_) | Library::Failed(_) => self.connect(address, username, password),
+        }
     }
 
     fn connect(&mut self, address: Address, username: Username, password: String) {
@@ -223,7 +264,7 @@ impl Bezel {
             state: Phase::Connecting,
             pointer: Pointer::Default,
             certificate: None,
-            trusted_once: false,
+            trust: Trust::Verified,
         });
     }
 
@@ -291,26 +332,38 @@ impl Bezel {
 
     /// "Trust and connect" for a first use, or the confirmed "Trust new certificate" for a change.
     pub fn trust(&mut self) {
-        let Some((live, prompt)) = self.prompt() else { return };
+        let Some((_, prompt)) = self.prompt() else { return };
         let (host, port) = (prompt.request.host.clone(), prompt.request.port);
         let remember = match &prompt.request.question {
             Question::FirstUse(certificate) => prompt.remember.then_some(certificate),
             Question::Changed { presented, .. } => Some(presented),
         };
         let change = remember.map(|c| Change::RememberCertificate(TrustedCertificate::new(&host, port, c, today())));
-        live.trusted_once = change.is_none();
         prompt.request.trust();
-        let Some(change) = change else { return };
-        match (&self.library, &self.store) {
-            // A change made while the file is still loading waits for it on the store's thread.
-            (Library::Ready(_) | Library::Loading, Some(store)) => store.apply(change),
-            (Library::Failed(e), _) => {
-                self.notice = Some(format!(
-                    "The certificate is trusted for now but was not remembered. {e}"
-                ))
+        let trust = match (change, &self.library, &self.store) {
+            (None, ..) => Trust::ThisSession,
+            (Some(change), Library::Ready(_), Some(store)) => {
+                store.apply(change);
+                Trust::Remembering
             }
-            _ => self.notice = Some("The certificate is trusted for now but was not remembered.".into()),
+            (Some(_), Library::Failed(e), _) => {
+                self.notice = Some(format!(
+                    "The certificate is trusted for this session but was not remembered. {e}"
+                ));
+                Trust::ThisSession
+            }
+            (Some(_), ..) => {
+                self.notice = Some("The certificate is trusted for this session but was not remembered.".into());
+                Trust::ThisSession
+            }
+        };
+        if let Screen::Session(live) = &mut self.screen {
+            live.trust = trust;
         }
+    }
+
+    pub fn dismiss_notice(&mut self) {
+        self.notice = None;
     }
 
     pub fn confirm_change(&mut self, confirming: bool) {
@@ -355,30 +408,21 @@ impl Bezel {
         let Screen::Session(live) = &mut self.screen else {
             return false;
         };
-        match event {
-            PhysicalInput::Key { key, pressed, .. } => {
-                let Some(scancode) = keymap::scancode(*key) else {
-                    return false;
-                };
-                match live.keyboard.key(scancode, *pressed) {
-                    KeyOutcome::Send(ops) => {
-                        if !ops.is_empty() {
-                            live.handle.input(Input::Keys(ops));
-                        }
-                        true
-                    }
-                    KeyOutcome::Shortcut(Shortcut::Close) => {
-                        self.disconnect();
-                        true
-                    }
-                    // Tabs, the palette and Settings arrive in later milestones; until then
-                    // Rune and the menus handle these keys (⌘Q quits).
-                    KeyOutcome::Shortcut(_) => false,
+        match keymap::translate(&mut live.keyboard, event) {
+            Translated::Key(KeyOutcome::Send(ops)) => {
+                if !ops.is_empty() {
+                    live.handle.input(Input::Keys(ops));
                 }
+                true
             }
-            PhysicalInput::Modifiers(_) => false,
-            PhysicalInput::FocusLost => {
-                live.keyboard.release_all();
+            Translated::Key(KeyOutcome::Shortcut(Shortcut::Close)) => {
+                self.disconnect();
+                true
+            }
+            // Tabs, the palette and Settings arrive in later milestones; until then Rune and
+            // the menus handle these keys (⌘Q quits).
+            Translated::Key(KeyOutcome::Shortcut(_)) | Translated::Pass => false,
+            Translated::FocusLost => {
                 live.handle.input(Input::ReleaseAll);
                 false
             }
@@ -401,7 +445,7 @@ pub fn fixture_session(address: Address, state: Phase, certificate: Option<Certi
             remember: false,
             confirming: false,
         }),
-        trusted_once: false,
+        trust: Trust::Verified,
     }
 }
 

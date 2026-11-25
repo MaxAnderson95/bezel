@@ -35,3 +35,39 @@ fn xdg(variable: &str, fallback: &str) -> PathBuf {
         .filter(|p| p.is_absolute())
         .unwrap_or_else(|| home().join(fallback))
 }
+
+/// Clears the key equivalents of the app menu's Hide and Hide Others, which winit installs, so
+/// ⌘H and ⌥⌘H reach the Session; the spec reserves neither. True once the menu bar exists and
+/// has been handled, so the caller can stop asking.
+#[cfg(target_os = "macos")]
+pub fn release_hide_shortcuts() -> bool {
+    use objc2::{MainThreadMarker, sel};
+    use objc2_app_kit::{NSApplication, NSMenu};
+    use objc2_foundation::NSString;
+
+    fn release(menu: &NSMenu) {
+        for i in 0..menu.numberOfItems() {
+            let Some(item) = menu.itemAtIndex(i) else { continue };
+            if let Some(submenu) = item.submenu() {
+                release(&submenu);
+            }
+            if matches!(item.action(), Some(action) if action == sel!(hide:) || action == sel!(hideOtherApplications:))
+            {
+                item.setKeyEquivalent(&NSString::new());
+            }
+        }
+    }
+
+    let Some(mtm) = MainThreadMarker::new() else {
+        return false;
+    };
+    let app = NSApplication::sharedApplication(mtm);
+    let Some(menu) = app.mainMenu() else { return false };
+    release(&menu);
+    true
+}
+
+#[cfg(not(target_os = "macos"))]
+pub fn release_hide_shortcuts() -> bool {
+    true
+}

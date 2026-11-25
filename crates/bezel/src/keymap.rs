@@ -1,8 +1,32 @@
 //! Physical keys as Rune names them, to PC scancodes (set 1). Both name a key by where it sits,
 //! not what it types, so this one table serves every keyboard layout.
 
-use bezel_core::keys::Scancode;
-use rune::PhysicalKeyCode as K;
+use bezel_core::keys::{KeyOutcome, Keyboard, Scancode};
+use rune::{PhysicalInput, PhysicalKeyCode as K};
+
+/// What a physical event over the desktop means for the Session.
+#[derive(Debug, PartialEq, Eq)]
+pub enum Translated {
+    Key(KeyOutcome),
+    /// The window lost the keyboard; everything held is released.
+    FocusLost,
+    /// Not the Session's: a key with no PC position, or modifier bookkeeping Rune also sends.
+    Pass,
+}
+
+pub fn translate(keyboard: &mut Keyboard, event: &PhysicalInput) -> Translated {
+    match event {
+        PhysicalInput::Key { key, pressed, .. } => match scancode(*key) {
+            Some(scancode) => Translated::Key(keyboard.key(scancode, *pressed)),
+            None => Translated::Pass,
+        },
+        PhysicalInput::Modifiers(_) => Translated::Pass,
+        PhysicalInput::FocusLost => {
+            keyboard.release_all();
+            Translated::FocusLost
+        }
+    }
+}
 
 pub fn scancode(key: K) -> Option<Scancode> {
     let code = match key {
@@ -141,7 +165,59 @@ pub fn scancode(key: K) -> Option<Scancode> {
 
 #[cfg(test)]
 mod tests {
+    use bezel_core::keys::{CommandKey, KeyOp};
+    use rune::Mods;
+
     use super::*;
+
+    fn key(key: K, pressed: bool, mods: Mods) -> PhysicalInput {
+        PhysicalInput::Key {
+            key,
+            mods,
+            pressed,
+            repeat: false,
+            text: None,
+            consumed_mods: Mods::default(),
+        }
+    }
+
+    /// The order winit delivers ⌘C on macOS: the ⌘ key and the modifier change it causes,
+    /// then C pressed and released with ⌘ held, then ⌘ released.
+    #[test]
+    fn command_c_from_macos_reaches_windows_as_control_c() {
+        let command = Mods {
+            cmd: true,
+            logo: true,
+            ..Mods::default()
+        };
+        let events = [
+            key(K::SuperLeft, true, command),
+            PhysicalInput::Modifiers(command),
+            key(K::KeyC, true, command),
+            key(K::KeyC, false, command),
+            key(K::SuperLeft, false, Mods::default()),
+            PhysicalInput::Modifiers(Mods::default()),
+        ];
+        let mut keyboard = Keyboard::new(CommandKey::MacShortcuts);
+        let sent: Vec<KeyOp> = events
+            .iter()
+            .flat_map(|e| match translate(&mut keyboard, e) {
+                Translated::Key(KeyOutcome::Send(ops)) => ops,
+                Translated::Pass => Vec::new(),
+                other => panic!("{e:?} became {other:?}"),
+            })
+            .collect();
+        let (ctrl, c) = (Scancode::CONTROL_LEFT, Scancode::new(0x2E));
+        assert_eq!(
+            sent,
+            vec![
+                KeyOp::Press(ctrl),
+                KeyOp::Press(c),
+                KeyOp::Release(c),
+                KeyOp::Release(ctrl)
+            ]
+        );
+    }
 
     #[test]
     fn letters_and_modifiers_map_to_their_pc_positions() {
