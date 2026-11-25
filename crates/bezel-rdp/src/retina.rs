@@ -52,6 +52,10 @@ impl Desktop {
 }
 
 impl Desktop {
+    pub fn same_scale(&self, other: &Desktop) -> bool {
+        (self.desktop_scale, self.device_scale) == (other.desktop_scale, other.device_scale)
+    }
+
     /// A Display Control layout carrying both scale factors, so a live resize keeps the device
     /// scale the connection started with instead of IronRDP deriving another from the desktop
     /// scale.

@@ -135,17 +135,20 @@ pub struct CertificateRequest {
     pub host: String,
     pub port: u16,
     pub question: Question,
-    reply: oneshot::Sender<bool>,
+    reply: oneshot::Sender<Answer>,
 }
 
 impl CertificateRequest {
-    /// Accepts the certificate for this Session, its reconnects included.
-    pub fn trust(self) {
-        let _ = self.reply.send(true);
+    /// Accepts the certificate. With `remember` (always the case for a changed certificate,
+    /// which replaces the Trusted one) it becomes the certificate this Session expects from
+    /// then on, so a different one on a later handshake is asked about as a change. Without,
+    /// it is the Session's one exception, for its reconnects included.
+    pub fn trust(self, remember: bool) {
+        let _ = self.reply.send(Answer::Trust { remember });
     }
 
     pub fn cancel(self) {
-        let _ = self.reply.send(false);
+        let _ = self.reply.send(Answer::Cancel);
     }
 
     /// A request no Session waits on, for fixture scenes.
@@ -157,6 +160,11 @@ impl CertificateRequest {
             reply: oneshot::channel().0,
         }
     }
+}
+
+pub(crate) enum Answer {
+    Trust { remember: bool },
+    Cancel,
 }
 
 enum Command {

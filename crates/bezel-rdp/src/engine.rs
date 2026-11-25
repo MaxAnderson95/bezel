@@ -8,12 +8,11 @@
 //! thread blocks, nothing times out, and the server never holds a half-open handshake while a
 //! dialog is up.
 
-use std::collections::HashSet;
 use std::pin::Pin;
 use std::sync::{Arc, Mutex, PoisonError};
 use std::time::Duration;
 
-use bezel_core::trust::{self, Certificate, CertificateError, Decision, Fingerprint, Question, TrustedCertificate};
+use bezel_core::trust::{Certificate, CertificateError, Decision, Question, SessionTrust};
 use ironrdp_client::config::{Config, ConfigBuilder, Destination};
 use ironrdp_client::output_channel::{OutputEventReceiver, output_channel};
 use ironrdp_client::rdp::{RdpClient, RdpInputEvent, RdpInputSender, RdpOutputEvent};
@@ -29,7 +28,7 @@ use crate::failure::{self, Ended, Failure};
 use crate::framebuffer::{Framebuffer, Region};
 use crate::input::{self, Outbox, Wheel};
 use crate::retina::Desktop;
-use crate::{Auth, CertificateRequest, Command, Event, Input, Pointer, PointerShape, State, Target, View};
+use crate::{Answer, Auth, CertificateRequest, Command, Event, Input, Pointer, PointerShape, State, Target, View};
 
 type Emit = Arc<dyn Fn(Event) + Send + Sync>;
 
@@ -62,14 +61,15 @@ pub(crate) fn spawn(
                     return;
                 }
             };
+            let trust = Arc::new(Mutex::new(SessionTrust::new(target.trusted_certificate.clone())));
             let engine = Engine {
+                trust,
                 view: target.view,
                 target,
                 auth,
                 emit,
                 commands,
                 framebuffer: Framebuffer::new(pixels),
-                trusted_once: Arc::default(),
             };
             runtime.block_on(engine.run());
         });
@@ -87,8 +87,8 @@ struct Engine {
     emit: Emit,
     commands: mpsc::UnboundedReceiver<Command>,
     framebuffer: Framebuffer,
-    /// Fingerprints trusted without Remember, which last for this Session's reconnects.
-    trusted_once: Arc<Mutex<HashSet<Fingerprint>>>,
+    /// What this Session trusts, shared with the certificate callback of every attempt.
+    trust: Arc<Mutex<SessionTrust>>,
     /// The latest content area the app reported.
     view: View,
 }
@@ -96,6 +96,8 @@ struct Engine {
 enum Outcome {
     Ended(Event),
     Ask(Question),
+    /// Connect again with a fresh configuration for the current View.
+    Reconnect,
 }
 
 /// The certificate callback's question for the attempt it refused.
@@ -120,49 +122,39 @@ impl Engine {
             let question = match self.attempt().await {
                 Outcome::Ended(event) => return self.emit(event),
                 Outcome::Ask(question) => question,
-            };
-            // Trusting a changed certificate replaces the pin for the rest of this Session too,
-            // so a later handshake presenting the old certificate is asked about again.
-            let replacement = match &question {
-                Question::Changed { presented, .. } => Some(TrustedCertificate::new(
-                    &host,
-                    port,
-                    presented,
-                    time::OffsetDateTime::now_utc().date(),
-                )),
-                Question::FirstUse(_) => None,
-            };
-            let presented = match &question {
-                Question::FirstUse(presented) | Question::Changed { presented, .. } => presented.sha256,
+                Outcome::Reconnect => continue,
             };
             let (reply, mut answer) = oneshot::channel();
             self.emit(Event::Certificate(CertificateRequest {
                 host: host.clone(),
                 port,
-                question,
+                question: question.clone(),
                 reply,
             }));
-            let trusted = loop {
+            let remember = loop {
                 tokio::select! {
-                    answer = &mut answer => break answer.unwrap_or(false),
+                    answer = &mut answer => break match answer {
+                        Ok(Answer::Trust { remember }) => Some(remember),
+                        Ok(Answer::Cancel) | Err(_) => None,
+                    },
                     command = self.commands.recv() => match command {
-                        None | Some(Command::Disconnect) => break false,
+                        None | Some(Command::Disconnect) => break None,
                         Some(Command::Resize(view)) => self.view = view,
                         Some(Command::Input(_) | Command::CtrlAltDel) => {}
                     },
                 }
             };
-            if !trusted {
+            let Some(remember) = remember else {
                 return self.emit(Event::State(State::Disconnected(Ended::by_user())));
-            }
-            info!(%host, port, fingerprint = %presented, "certificate trusted for this session");
-            if let Some(replacement) = replacement {
-                self.target.trusted_certificate = Some(replacement);
-            }
-            self.trusted_once
-                .lock()
-                .unwrap_or_else(PoisonError::into_inner)
-                .insert(presented);
+            };
+            info!(%host, port, remember, "certificate trusted");
+            self.trust.lock().unwrap_or_else(PoisonError::into_inner).accept(
+                &host,
+                port,
+                &question,
+                remember,
+                time::OffsetDateTime::now_utc().date(),
+            );
             self.emit(Event::State(State::Connecting));
         }
     }
@@ -188,6 +180,8 @@ impl Engine {
             outbox: Outbox::default(),
             database: Database::new(),
             wheel: Wheel::default(),
+            configured: requested,
+            retry_at: None,
             requested,
             connected: false,
             resize_at: None,
@@ -210,16 +204,13 @@ impl Engine {
         // Once the client finishes, its output channel closes and the receiver drains to the end.
         let mut running = true;
         loop {
-            let resize_at = attempt.resize_at;
-            let resize = async move {
-                match resize_at {
-                    Some(at) => tokio::time::sleep_until(at).await,
-                    None => std::future::pending().await,
-                }
-            };
+            let resize = sleep_until(attempt.resize_at);
             tokio::select! {
                 () = &mut run, if running => running = false,
-                () = tokio::time::sleep(INPUT_RETRY), if !attempt.outbox.is_empty() => attempt.flush(),
+                () = sleep_until(attempt.retry_at) => {
+                    attempt.retry_at = None;
+                    attempt.flush();
+                }
                 event = receiver.recv() => {
                     let mut next = event;
                     // Take every event already waiting before publishing, so a burst of updates
@@ -289,6 +280,11 @@ impl Engine {
                 info!(%host, ?reason, "the server cannot resize in place; reconnecting at the new size");
                 attempt.connected = false;
                 self.emit(Event::State(State::Reconnecting));
+                // IronRDP's own reconnect keeps the scale factors the attempt was configured
+                // with, so a move to a display of another scale connects again from scratch.
+                if !Desktop::for_view(self.view).same_scale(&attempt.configured) {
+                    return Some(Outcome::Reconnect);
+                }
             }
             RdpOutputEvent::PointerDefault => self.emit(Event::Pointer(Pointer::Default)),
             RdpOutputEvent::PointerHidden => self.emit(Event::Pointer(Pointer::Hidden)),
@@ -366,14 +362,8 @@ impl Engine {
     }
 
     fn config(&self, desktop: Desktop, pending: Pending) -> anyhow::Result<Config> {
-        let Target {
-            host,
-            port,
-            trusted_certificate,
-            ..
-        } = &self.target;
-        let trusted = trusted_certificate.clone();
-        let trusted_once = self.trusted_once.clone();
+        let Target { host, port, .. } = &self.target;
+        let trust = self.trust.clone();
         let callback = Arc::new(move |der: &[u8], _endpoint: &str, reason: &str| {
             let mut pending = pending.lock().unwrap_or_else(PoisonError::into_inner);
             let certificate = match Certificate::parse(der) {
@@ -383,8 +373,11 @@ impl Engine {
                     return false;
                 }
             };
-            let once = trusted_once.lock().unwrap_or_else(PoisonError::into_inner);
-            match trust::decide(&certificate, false, trusted.as_ref(), &once) {
+            let decision = trust
+                .lock()
+                .unwrap_or_else(PoisonError::into_inner)
+                .decide(&certificate);
+            match decision {
                 Decision::Accept => true,
                 Decision::Ask(question) => {
                     info!(reason, fingerprint = %certificate.sha256, "the certificate needs a decision");
@@ -433,6 +426,12 @@ struct Attempt {
     wheel: Wheel,
     /// What the server was last asked for.
     requested: Desktop,
+    /// What the attempt's configuration asked for, whose scale factors IronRDP keeps when it
+    /// reconnects on its own.
+    configured: Desktop,
+    /// When to offer the outbox to IronRDP again, kept across wakes so other traffic can't
+    /// postpone it.
+    retry_at: Option<Instant>,
     connected: bool,
     resize_at: Option<Instant>,
     pending: Pending,
@@ -455,6 +454,10 @@ impl Attempt {
                 // The session is closing; its end arrives as an output event.
                 Err(_) => Ok(()),
             });
+        self.retry_at = match self.outbox.is_empty() {
+            true => None,
+            false => Some(self.retry_at.unwrap_or_else(|| Instant::now() + INPUT_RETRY)),
+        };
     }
 
     fn resize_to(&mut self, desktop: Desktop) {
@@ -475,6 +478,14 @@ impl Attempt {
                 self.resize_at = Some(Instant::now() + INPUT_RETRY);
             }
         }
+    }
+}
+
+/// Sleeps until `at`, or forever when there is nothing to wait for.
+async fn sleep_until(at: Option<Instant>) {
+    match at {
+        Some(at) => tokio::time::sleep_until(at).await,
+        None => std::future::pending().await,
     }
 }
 
