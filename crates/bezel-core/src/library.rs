@@ -67,31 +67,7 @@ impl Library {
     /// that fails to parse is an error, and no Library exists to overwrite it.
     pub fn open(path: impl Into<PathBuf>) -> Result<Self, LibraryError> {
         let path = path.into();
-        let source = match fs::read_to_string(&path) {
-            Ok(source) => source,
-            Err(e) if e.kind() == io::ErrorKind::NotFound => {
-                return Ok(Self {
-                    path,
-                    file: File {
-                        version: VERSION,
-                        trusted_certificates: Vec::new(),
-                        rest: toml::Table::new(),
-                    },
-                });
-            }
-            Err(source) => return Err(LibraryError::Read { path, source }),
-        };
-        let file: File = toml::from_str(&source).map_err(|e| LibraryError::Parse {
-            line: e.span().map(|span| source[..span.start].lines().count().max(1)),
-            message: e.message().to_owned(),
-            path: path.clone(),
-        })?;
-        if file.version != VERSION {
-            return Err(LibraryError::Version {
-                path,
-                found: file.version,
-            });
-        }
+        let file = read(&path)?;
         Ok(Self { path, file })
     }
 
@@ -105,10 +81,14 @@ impl Library {
         }
     }
 
-    /// Applies the change and saves. On a failed save the Library keeps its previous state.
+    /// Applies the change to the file as it is on disk now and saves it. A hand edit or another
+    /// Bezel may have changed the file since it was opened, so the change never replaces it
+    /// with an older copy, and a file that no longer parses is refused rather than overwritten.
+    /// On any error the file and the Library are left as they were.
     pub fn apply(&mut self, change: Change) -> Result<(), LibraryError> {
-        let previous = self.file.trusted_certificates.clone();
-        let certificates = &mut self.file.trusted_certificates;
+        let _lock = lock(&self.path)?;
+        let mut file = read(&self.path)?;
+        let certificates = &mut file.trusted_certificates;
         match change {
             Change::RememberCertificate(trusted) => {
                 certificates.retain(|t| !t.is_for(&trusted.host, trusted.port));
@@ -116,26 +96,74 @@ impl Library {
             }
             Change::ForgetCertificate { host, port } => certificates.retain(|t| !t.is_for(&host, port)),
         }
-        self.save().inspect_err(|_| self.file.trusted_certificates = previous)
-    }
-
-    fn save(&self) -> Result<(), LibraryError> {
         let error = |source| LibraryError::Write {
             path: self.path.clone(),
             source,
         };
-        let text = toml::to_string(&self.file).map_err(|e| error(io::Error::other(e)))?;
-        write_atomically(&self.path, text.as_bytes()).map_err(error)
+        let text = toml::to_string(&file).map_err(|e| error(io::Error::other(e)))?;
+        write_atomically(&self.path, text.as_bytes()).map_err(error)?;
+        self.file = file;
+        Ok(())
     }
+}
+
+fn read(path: &Path) -> Result<File, LibraryError> {
+    let source = match fs::read_to_string(path) {
+        Ok(source) => source,
+        Err(e) if e.kind() == io::ErrorKind::NotFound => {
+            return Ok(File {
+                version: VERSION,
+                trusted_certificates: Vec::new(),
+                rest: toml::Table::new(),
+            });
+        }
+        Err(source) => {
+            return Err(LibraryError::Read {
+                path: path.into(),
+                source,
+            });
+        }
+    };
+    let file: File = toml::from_str(&source).map_err(|e| LibraryError::Parse {
+        line: e.span().map(|span| source[..span.start].lines().count().max(1)),
+        message: e.message().to_owned(),
+        path: path.into(),
+    })?;
+    if file.version != VERSION {
+        return Err(LibraryError::Version {
+            path: path.into(),
+            found: file.version,
+        });
+    }
+    Ok(file)
+}
+
+/// Holds an exclusive lock on a file beside the Library's, so two Bezels saving at once take
+/// turns instead of each writing over the other's change. Released when dropped.
+fn lock(path: &Path) -> Result<fs::File, LibraryError> {
+    let error = |source| LibraryError::Write {
+        path: path.into(),
+        source,
+    };
+    let mut name = path.file_name().unwrap_or_default().to_os_string();
+    name.push(".lock");
+    let dir = parent(path);
+    fs::create_dir_all(dir).map_err(error)?;
+    let file = fs::File::create(dir.join(name)).map_err(error)?;
+    file.lock().map_err(error)?;
+    Ok(file)
+}
+
+fn parent(path: &Path) -> &Path {
+    path.parent()
+        .filter(|p| !p.as_os_str().is_empty())
+        .unwrap_or(Path::new("."))
 }
 
 /// Writes beside the target and renames over it, so a crash leaves the old file or the new
 /// one, never half of either.
 fn write_atomically(path: &Path, contents: &[u8]) -> io::Result<()> {
-    let dir = path
-        .parent()
-        .filter(|p| !p.as_os_str().is_empty())
-        .unwrap_or(Path::new("."));
+    let dir = parent(path);
     fs::create_dir_all(dir)?;
     let mut name = path.file_name().unwrap_or_default().to_os_string();
     name.push(format!(".{}.tmp", std::process::id()));
@@ -321,6 +349,53 @@ mod tests {
         assert_eq!(saved["settings"]["appearance"].as_str(), Some("dark"));
         assert_eq!(saved["groups"][0]["name"].as_str(), Some("Infrastructure"));
         assert_eq!(saved["trusted_certificates"].as_array().map(Vec::len), Some(1));
+    }
+
+    #[test]
+    fn a_change_keeps_edits_made_to_the_file_after_it_was_opened() {
+        let (_dir, path) = temp_path();
+        let mut library = Library::open(&path).unwrap();
+        let mut other = Library::open(&path).unwrap();
+        other
+            .apply(Change::RememberCertificate(trusted("dc01.corp.lan", 2)))
+            .unwrap();
+        fs::write(
+            &path,
+            format!(
+                "{}\n[settings]\nappearance = \"dark\"\n",
+                fs::read_to_string(&path).unwrap()
+            ),
+        )
+        .unwrap();
+        library
+            .apply(Change::RememberCertificate(trusted("fs01.corp.lan", 1)))
+            .unwrap();
+        let saved: toml::Table = toml::from_str(&fs::read_to_string(&path).unwrap()).unwrap();
+        assert_eq!(saved["settings"]["appearance"].as_str(), Some("dark"));
+        assert_eq!(
+            library.snapshot().trusted_certificates,
+            vec![trusted("dc01.corp.lan", 2), trusted("fs01.corp.lan", 1)]
+        );
+    }
+
+    #[test]
+    fn a_change_is_refused_when_the_file_stopped_parsing_after_it_was_opened() {
+        let (_dir, path) = temp_path();
+        let mut library = Library::open(&path).unwrap();
+        library
+            .apply(Change::RememberCertificate(trusted("fs01.corp.lan", 1)))
+            .unwrap();
+        let broken = "version = 1\n[[trusted_certificates]\n";
+        fs::write(&path, broken).unwrap();
+        assert!(matches!(
+            library.apply(Change::RememberCertificate(trusted("dc01.corp.lan", 2))),
+            Err(LibraryError::Parse { .. })
+        ));
+        assert_eq!(fs::read_to_string(&path).unwrap(), broken);
+        assert_eq!(
+            library.snapshot().trusted_certificates,
+            vec![trusted("fs01.corp.lan", 1)]
+        );
     }
 
     #[test]

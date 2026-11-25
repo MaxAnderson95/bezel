@@ -154,7 +154,7 @@ not_after = 2027-03-14
 remembered = 2026-10-03
 ```
 
-A file that fails to parse is never overwritten: Bezel shows the parse error with the line, and offers Open data folder.
+A file that fails to parse is never overwritten: Bezel shows the parse error with the line, and offers Open data folder. Each save applies its change to the file as it is on disk at that moment and keeps any table that version of Bezel doesn't know, so hand edits and newer data survive.
 
 ## Architecture
 

@@ -19,7 +19,7 @@ Bezel is a lightweight RDP client written in Rust using [Rune](https://github.co
 
 Changing any of these breaks existing users or the spec:
 
-- The `bezel.toml` format in the spec's Data section, written atomically, never overwritten when it fails to parse, with unknown tables carried through a save.
+- The `bezel.toml` format in the spec's Data section: written atomically under a lock file, each change applied to the file as it is on disk then, never overwritten when it fails to parse, with unknown tables carried through a save.
 - The Keychain service `io.github.maxanderson95.bezel` with account `<credential id>` (from M2).
 - Rune and IronRDP revisions: one pin each in the workspace `Cargo.toml`. A Rune bump also updates every `[patch.crates-io]` entry to the same rev from Rune's own `Cargo.toml`; an IronRDP bump also updates `IRONRDP_REVISION` in `crates/bezel-rdp/src/lib.rs`.
 
