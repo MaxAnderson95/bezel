@@ -46,3 +46,12 @@ jobs:
 
       - name: Test
         run: cargo test --workspace --locked
+
+      # The golden test runs on macOS only (crates/bezel/tests/goldens.rs).
+      - name: Upload renders that missed their goldens
+        if: failure() && runner.os == 'macOS'
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        with:
+          name: golden-actual
+          path: target/tmp/golden-actual
+          if-no-files-found: ignore

@@ -10,6 +10,7 @@ use time::macros::date;
 
 use crate::app::{
     Bezel, Destination, Library, Opening, Phase, Screen, Session, fixture_retry, fixture_session, fixture_sign_in,
+    today,
 };
 use crate::manage::Delete;
 use crate::windows::Window;
@@ -186,6 +187,34 @@ pub const SCENES: &[Scene] = &[
         s.library = Library::Ready(library());
         s.ask_delete(Delete::Group("g_infra".into()));
     }),
+    ("certificate-confirm", |s| {
+        s.library = Library::Ready(library());
+        let question = Question::Changed {
+            trusted: trusted(),
+            presented: certificate(),
+        };
+        let request = CertificateRequest::detached("fs01.corp.lan", 3389, question);
+        let mut session = fixture_session(1, Destination::new_host(fs01()), Phase::Connecting, Some(request));
+        if let Screen::Live(live) = &mut session.screen
+            && let Some(prompt) = &mut live.certificate
+        {
+            prompt.confirming = true;
+        }
+        tab(s, session);
+    }),
+    ("reconnecting", |s| {
+        s.library = Library::Ready(library());
+        let mut session = connected(1, &dc01());
+        if let Screen::Live(live) = &mut session.screen {
+            live.state = Phase::Reconnecting;
+        }
+        tab(s, session);
+    }),
+    ("notice", |s| {
+        s.library = Library::Ready(library());
+        tab(s, connected(1, &dc01()));
+        s.notice = Some("Bezel couldn't save that change. The disk is full.".into());
+    }),
     ("certificates", |s| {
         s.library = Library::Ready(library());
         s.open_certificates();
@@ -203,8 +232,9 @@ fn session(id: u64, to: Destination, screen: Screen) -> Session {
     session
 }
 
+/// Connected, showing a desktop.
 fn connected(id: u64, connection: &Connection) -> Session {
-    fixture_session(
+    let session = fixture_session(
         id,
         Destination::connection(connection),
         Phase::Connected {
@@ -212,7 +242,32 @@ fn connected(id: u64, connection: &Connection) -> Session {
             height: 1280,
         },
         None,
-    )
+    );
+    if let Some(live) = session.live() {
+        let (width, height) = (256, 160);
+        live.handle
+            .framebuffer()
+            .set(width, height, desktop_rgba(width, height));
+    }
+    session
+}
+
+/// What a server might send: a blue wallpaper over a dark taskbar. It stands in for remote
+/// pixels, which no kit token describes.
+fn desktop_rgba(width: u32, height: u32) -> Vec<u8> {
+    let taskbar = height - height / 16;
+    (0..height)
+        .flat_map(|y| {
+            (0..width).flat_map(move |x| {
+                if y >= taskbar {
+                    [32, 32, 40, 255]
+                } else {
+                    let t = (x + y) * 255 / (width + taskbar);
+                    [16, (64 + t / 3) as u8, (140 + t / 3) as u8, 255]
+                }
+            })
+        })
+        .collect()
 }
 
 /// Adds the Session as a Tab and makes it the current one.
@@ -289,7 +344,8 @@ fn library() -> Snapshot {
                 id: "c_admin".into(),
                 name: "Domain admin".into(),
                 username: r"CORP\admin.max".into(),
-                password_updated: Some(date!(2026 - 08 - 23)),
+                // Relative to today, as the Credentials window counts the days to it.
+                password_updated: Some(today() - time::Duration::days(95)),
             },
             Credential {
                 id: "c_local".into(),

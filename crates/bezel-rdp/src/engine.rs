@@ -236,30 +236,27 @@ impl Engine {
                 // IronRDP checks with the engine only between tries, and a server can take a
                 // try's connection and then say nothing.
                 () = sleep_until(attempt.dropped.map(|at| at + RECONNECT_FOR)) => {
-                    info!(host = %self.target.host, "the connection did not come back in time");
-                    return Outcome::Ended(disconnected(failure::not_back(None, &self.target.host)));
+                    // A reconnect that finished as time ran out has its event waiting, and
+                    // `select!` may have picked this branch over it.
+                    if let Ok(Some(event)) = tokio::time::timeout(Duration::ZERO, receiver.recv()).await
+                        && let Some(outcome) = self.on_events(attempt, receiver, event).await
+                    {
+                        return outcome;
+                    }
+                    if attempt.dropped.is_some() {
+                        info!(host = %self.target.host, "the connection did not come back in time");
+                        return Outcome::Ended(disconnected(failure::not_back(None, &self.target.host)));
+                    }
                 }
                 () = sleep_until(attempt.retry_at) => {
                     attempt.retry_at = None;
                     attempt.flush();
                 }
                 event = receiver.recv() => {
-                    let mut next = event;
-                    // Take every event already waiting before publishing, so a burst of updates
-                    // costs one copy into the framebuffer the app draws.
-                    loop {
-                        let Some(event) = next else {
-                            return Outcome::Ended(disconnected(Ended::plain(format!("The connection to {} ended", self.target.host))));
-                        };
-                        if let Some(outcome) = self.on_event(attempt, event) {
-                            return outcome;
-                        }
-                        match tokio::time::timeout(Duration::ZERO, receiver.recv()).await {
-                            Ok(event) => next = event,
-                            Err(_) => break,
-                        }
+                    let Some(event) = event else { return self.closed() };
+                    if let Some(outcome) = self.on_events(attempt, receiver, event).await {
+                        return outcome;
                     }
-                    self.framebuffer.publish();
                 }
                 command = self.commands.recv() => match command {
                     None | Some(Command::Disconnect) => return Outcome::Ended(disconnected(Ended::by_user())),
@@ -280,6 +277,37 @@ impl Engine {
                 }
             }
         }
+    }
+
+    /// Handles `first` and every event already waiting behind it before publishing, so a burst
+    /// of updates costs one copy into the framebuffer the app draws.
+    async fn on_events(
+        &mut self,
+        attempt: &mut Attempt,
+        receiver: &mut OutputEventReceiver,
+        first: RdpOutputEvent,
+    ) -> Option<Outcome> {
+        let mut next = first;
+        loop {
+            if let Some(outcome) = self.on_event(attempt, next) {
+                return Some(outcome);
+            }
+            match tokio::time::timeout(Duration::ZERO, receiver.recv()).await {
+                Ok(Some(event)) => next = event,
+                Ok(None) => return Some(self.closed()),
+                Err(_) => break,
+            }
+        }
+        self.framebuffer.publish();
+        None
+    }
+
+    /// IronRDP's client finished and its output channel has nothing more.
+    fn closed(&self) -> Outcome {
+        Outcome::Ended(disconnected(Ended::plain(format!(
+            "The connection to {} ended",
+            self.target.host
+        ))))
     }
 
     fn on_event(&mut self, attempt: &mut Attempt, event: RdpOutputEvent) -> Option<Outcome> {
@@ -596,4 +624,99 @@ async fn sleep_until(at: Option<Instant>) {
 
 fn disconnected(ended: Ended) -> Event {
     Event::State(State::Disconnected(ended))
+}
+
+#[cfg(test)]
+mod tests {
+    use bezel_core::usernames::Username;
+
+    use super::*;
+
+    /// An engine for dc01 whose events go nowhere, with the sender that keeps its commands open.
+    fn engine() -> (Engine, mpsc::UnboundedSender<Command>) {
+        let view = View {
+            width: 1024.0,
+            height: 768.0,
+            scale: 2.0,
+        };
+        let emit: Emit = Arc::new(|_| {});
+        let (commands, receiver) = mpsc::unbounded_channel();
+        let engine = Engine {
+            target: Target {
+                host: "dc01.corp.lan".into(),
+                port: 3389,
+                view,
+                trusted_certificate: None,
+            },
+            auth: Auth {
+                username: Username::parse("administrator").unwrap(),
+                password: String::new().into(),
+            },
+            clipboard: Clipboard::new(emit.clone()),
+            emit,
+            commands: receiver,
+            framebuffer: Framebuffer::new(Pixels::new()),
+            trust: Arc::new(Mutex::new(SessionTrust::new(None))),
+            view,
+            muted: Arc::default(),
+        };
+        (engine, commands)
+    }
+
+    /// An attempt whose link dropped longer than `RECONNECT_FOR` ago, with the receiver that
+    /// keeps its input queue open.
+    fn dropped_at_the_deadline(engine: &Engine) -> (Attempt, tokio::sync::mpsc::Receiver<RdpInputEvent>) {
+        let (input, queue) = RdpInputSender::channel(8);
+        let requested = Desktop::for_view(engine.view);
+        let attempt = Attempt {
+            input,
+            outbox: Outbox::default(),
+            database: Database::new(),
+            wheel: Wheel::default(),
+            requested,
+            configured: requested,
+            retry_at: None,
+            connected: false,
+            resize_at: None,
+            pending: Pending::default(),
+            // A second over, so the deadline has passed by tokio's millisecond timer too.
+            dropped: Some(Instant::now() - RECONNECT_FOR - Duration::from_secs(1)),
+            size: (2048, 1536),
+        };
+        (attempt, queue)
+    }
+
+    /// The deadline and a reconnect that already succeeded are both ready: the Session is back.
+    #[tokio::test]
+    async fn a_reconnect_waiting_at_the_deadline_wins() {
+        // `select!` picks among ready branches at random, so enough runs meet both orders.
+        for _ in 0..32 {
+            let (mut engine, _commands) = engine();
+            let (mut attempt, _queue) = dropped_at_the_deadline(&engine);
+            let (sender, mut receiver) = output_channel(4);
+            sender.try_send(RdpOutputEvent::AutoReconnected).unwrap();
+            let mut run = std::pin::pin!(std::future::pending::<()>());
+            let drive = engine.drive(&mut attempt, &mut receiver, run.as_mut());
+            let ended = tokio::time::timeout(Duration::from_millis(20), drive).await.is_ok();
+            assert!(!ended, "the Session ended at the deadline");
+            assert!(attempt.dropped.is_none() && attempt.connected);
+        }
+    }
+
+    /// A server that says nothing by the deadline ends the Session.
+    #[tokio::test]
+    async fn a_silent_server_ends_the_session_at_the_deadline() {
+        let (mut engine, _commands) = engine();
+        let (mut attempt, _queue) = dropped_at_the_deadline(&engine);
+        let (_sender, mut receiver) = output_channel(4);
+        let mut run = std::pin::pin!(std::future::pending::<()>());
+        let drive = engine.drive(&mut attempt, &mut receiver, run.as_mut());
+        let outcome = tokio::time::timeout(Duration::from_secs(1), drive)
+            .await
+            .expect("an ending");
+        assert!(matches!(
+            outcome,
+            Outcome::Ended(Event::State(State::Disconnected(ended))) if ended.message.ends_with("did not come back")
+        ));
+    }
 }

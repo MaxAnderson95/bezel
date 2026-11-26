@@ -4,10 +4,11 @@ set -eu
 cd "$(dirname "$0")/.."
 cargo build --locked --release -p bezel
 app=target/release/Bezel.app
-mkdir -p "$app/Contents/MacOS"
+mkdir -p "$app/Contents/MacOS" "$app/Contents/Resources"
 # Replace the executable's inode so a running copy keeps the previous build.
 cp target/release/bezel "$app/Contents/MacOS/bezel.new"
 mv -f "$app/Contents/MacOS/bezel.new" "$app/Contents/MacOS/bezel"
+cp assets/Bezel.icns "$app/Contents/Resources/Bezel.icns"
 version=$(cargo metadata --no-deps --format-version 1 | sed -n 's/.*"name":"bezel","version":"\([^"]*\)".*/\1/p')
 cat > "$app/Contents/Info.plist" <<PLIST
 <?xml version="1.0" encoding="UTF-8"?>
@@ -15,6 +16,7 @@ cat > "$app/Contents/Info.plist" <<PLIST
 <plist version="1.0">
 <dict>
   <key>CFBundleExecutable</key><string>bezel</string>
+  <key>CFBundleIconFile</key><string>Bezel</string>
   <key>CFBundleIdentifier</key><string>io.github.maxanderson95.bezel</string>
   <key>CFBundleName</key><string>Bezel</string>
   <key>CFBundlePackageType</key><string>APPL</string>

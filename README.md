@@ -18,11 +18,13 @@ scripts/bundle.sh
 open target/release/Bezel.app
 ```
 
-`scripts/bundle.sh` builds a release binary and wraps it in `Bezel.app` with an ad-hoc signature for this Mac. `cargo run -p bezel` runs it without a bundle.
+`scripts/bundle.sh` builds a release binary and wraps it in `Bezel.app`, with its icon and an ad-hoc signature for this Mac. `cargo run -p bezel` runs it without a bundle.
 
 ## Use
 
-Type a host name (`dc01.corp.lan`, `dc01:3390` or an IP address) and press Return, then sign in with `DOMAIN\user`, `user@domain` or a local `user` and its password. Bezel signs in with Kerberos when it can find a domain controller, NTLM otherwise, and shows the Windows login screen on servers with Network Level Authentication off.
+Press ⌘K, type a host name (`dc01.corp.lan`, `dc01:3390` or an IP address) and press Return. Bezel opens each Session in a Tab and asks for `DOMAIN\user`, `user@domain` or a local `user` and its password. It signs in with Kerberos when it can find a domain controller, NTLM otherwise, and shows the Windows login screen on servers with Network Level Authentication off.
+
+The same ⌘K palette finds open Sessions and saved Connections by name or host: Return opens or switches to one, and ⌘Return opens it in its own window. ⌥Return edits a saved Connection, or opens another Session of one already open. ⌘1 to ⌘9 and ⇧⌘[ / ⇧⌘] switch Tabs, ⌘W disconnects one, and ⌃⌘F goes full screen. Drag a Tab off the tab row, or choose Move to new window, to give a Session its own window; Move to main window or dragging it back onto the tab row makes it a Tab again.
 
 Save servers with + at the foot of the sidebar (New connection, New group). Clicking a Connection signs in with its Credential, or asks for a username and password when it is set to "Ask each time". Right-click a Connection or Group for Edit, Duplicate, Move to group, Rename and Delete, or drag Connections between Groups and Groups into a new order. ⌃⌘S hides the sidebar.
 
@@ -30,7 +32,11 @@ A Credential is a named username and password that any number of Connections sha
 
 When a server's certificate doesn't come from an authority the Mac trusts, Bezel shows its fingerprint and asks. Tick "Remember this certificate" to be asked only if it changes. Certificates in the sidebar lists the remembered ones and removes them.
 
-⌘ plus a key reaches Windows as Ctrl plus that key, so ⌘C and ⌘V copy and paste; ⌘ pressed alone is the Windows key. ⌘W disconnects.
+⌘ plus a key reaches Windows as Ctrl plus that key, so ⌘C and ⌘V copy and paste, and text copied on either side pastes on the other. ⌘ pressed alone is the Windows key; Settings can make ⌘ the Windows key in every combination instead. Sound from Windows plays on the Mac, and Mute in a Session's … menu silences it.
+
+When the network drops, the desktop dims with "Reconnecting…" and Bezel tries to bring the same Windows session back for about 30 seconds before offering a Reconnect button.
+
+Settings (⌘,) has Appearance (System, Light, Dark), the ⌘ key, whether "Remember this certificate" starts ticked, and Open data folder.
 
 ## Files
 

@@ -341,6 +341,7 @@ fn row_el(entry: &Row, index: usize, selected: bool, k: &Kit) -> El {
         .gap(8.0)
         .center_y()
         .radius(k.radius.md)
+        .hover_motion(rune::Anim::INSTANT, rune::Anim::INSTANT)
         .child(rune::icon(glyph, 16.0).color(k.c.icon_muted))
         .child(
             text(entry.title.clone())
