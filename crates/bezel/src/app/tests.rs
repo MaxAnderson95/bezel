@@ -131,7 +131,6 @@ fn live_tab(bezel: &mut Bezel, connection: &str, credential: Option<&str>, engin
         credential: snapshot(bezel).credential(&id.into()).unwrap().clone(),
         adding: None,
         assign: false,
-        assigning: None,
     });
     let id = bezel.next_id();
     let mut session = fixture_session(id, Destination::connection(&found), Phase::Connecting, None);
@@ -1150,4 +1149,108 @@ fn a_quit_question_closes_the_palette_over_it() {
         let _ = crate::windows::on_quit_request(s, tx);
     });
     assert!(rt.state.quitting && !rt.state.here.palette.open);
+}
+
+fn physical(key: rune::PhysicalKeyCode, mods: Mods) -> PhysicalInput {
+    PhysicalInput::Key {
+        key,
+        mods,
+        pressed: true,
+        repeat: false,
+        text: None,
+        consumed_mods: Mods::default(),
+    }
+}
+
+#[test]
+fn a_command_chord_held_across_a_tab_switch_still_switches_tabs() {
+    use rune::PhysicalKeyCode as K;
+    let Fixture { mut bezel, _alive, .. } = fixture();
+    let tabs: Vec<SessionId> = (0..4).map(|i| live_tab(&mut bezel, "n_dc01", None, 701 + i)).collect();
+    bezel.reveal(tabs[0]);
+    let mut rt = Runtime::new(bezel, crate::view::view, (800.0, 600.0), Env::new(false, 1.0));
+    let command = Mods {
+        cmd: true,
+        logo: true,
+        ..Mods::default()
+    };
+    let shift_command = Mods { shift: true, ..command };
+    let press = |rt: &mut Runtime<Bezel>, key: K, mods: Mods| {
+        let id = rt.state.active.expect("a current Tab");
+        let mut taken = false;
+        rt.update(|s, tx| taken = s.physical(id, &physical(key, mods), tx));
+        assert!(taken);
+    };
+    // ⌘2 then, with ⌘ still down in the new Tab, 3.
+    press(&mut rt, K::SuperLeft, command);
+    press(&mut rt, K::Digit2, command);
+    assert_eq!(rt.state.active, Some(tabs[1]));
+    press(&mut rt, K::Digit3, command);
+    assert_eq!(rt.state.active, Some(tabs[2]), "⌘3, not a 3 typed into Tab 2");
+    // ⇧⌘] twice without letting go.
+    press(&mut rt, K::ShiftLeft, shift_command);
+    press(&mut rt, K::BracketRight, shift_command);
+    assert_eq!(rt.state.active, Some(tabs[3]));
+    press(&mut rt, K::BracketRight, shift_command);
+    assert_eq!(rt.state.active, Some(tabs[0]));
+    for id in &tabs[1..] {
+        assert!(
+            !holds_keys(&mut rt.state, *id),
+            "every Tab left lets go of what it held"
+        );
+    }
+}
+
+#[test]
+fn a_refused_assignment_after_the_session_ended_is_still_reported_on_it() {
+    let Fixture { mut bezel, _alive, .. } = fixture();
+    let (id, _) = sign_in_saving(&mut bezel, "typed");
+    wait_until(&mut bezel, |b| snapshot(b).credentials.len() == 2);
+    block_saves(&_alive);
+    let engine = engine(&bezel, id);
+    bezel.on_engine(engine, connected());
+    bezel.on_engine(
+        engine,
+        Event::State(State::Disconnected(Ended {
+            message: "lab dropped".into(),
+            details: String::new(),
+            by_user: false,
+        })),
+    );
+    assert!(matches!(screen(&bezel, id), Screen::Ended(_)));
+    wait_until(&mut bezel, |b| b.session(id).unwrap().notice.is_some());
+    assert!(bezel.notice.is_none());
+}
+
+#[test]
+fn the_palette_lists_only_sessions_still_open() {
+    let Fixture { mut bezel, _alive, .. } = fixture();
+    let ended = live_tab(&mut bezel, "n_dc01", None, 701);
+    bezel.on_engine(
+        701,
+        Event::State(State::Disconnected(Ended {
+            message: "dc01 dropped".into(),
+            details: String::new(),
+            by_user: false,
+        })),
+    );
+    let live = live_tab(&mut bezel, "n_dc02", None, 702);
+    let rows = crate::palette::rows("dc", &bezel.sessions, bezel.library.ready());
+    let open: Vec<_> = rows
+        .iter()
+        .filter_map(|r| match r.item {
+            crate::palette::Item::Open(id) => Some(id),
+            _ => None,
+        })
+        .collect();
+    assert_eq!(open, vec![live]);
+    // Return on dc01's Saved row starts the ended Tab again.
+    let index = rows
+        .iter()
+        .position(|r| r.item == crate::palette::Item::Saved("n_dc01".into()))
+        .unwrap();
+    bezel.here.palette.query = TextEdit::new("dc");
+    bezel.choose(index, crate::palette::How::Return);
+    assert_eq!(bezel.active, Some(ended));
+    assert!(!matches!(screen(&bezel, ended), Screen::Ended(_)));
 }

@@ -1,13 +1,15 @@
 //! Physical keys as Rune names them, to PC scancodes (set 1). Both name a key by where it sits,
 //! not what it types, so this one table serves every keyboard layout.
 
-use bezel_core::keys::{KeyOutcome, Keyboard, Scancode};
-use rune::{PhysicalInput, PhysicalKeyCode as K};
+use bezel_core::keys::{Held, KeyOp, KeyOutcome, Keyboard, Scancode};
+use rune::{Mods, PhysicalInput, PhysicalKeyCode as K};
 
 /// What a physical event over the desktop means for the Session.
 #[derive(Debug, PartialEq, Eq)]
 pub enum Translated {
-    Key(KeyOutcome),
+    /// Modifiers held from before the Session had the keyboard, pressed for it first, and what
+    /// the key itself makes.
+    Key(Vec<KeyOp>, KeyOutcome),
     /// The window lost the keyboard; everything held is released.
     FocusLost,
     /// Not the Session's: a key with no PC position, or modifier bookkeeping Rune also sends.
@@ -16,8 +18,11 @@ pub enum Translated {
 
 pub fn translate(keyboard: &mut Keyboard, event: &PhysicalInput) -> Translated {
     match event {
-        PhysicalInput::Key { key, pressed, .. } => match scancode(*key) {
-            Some(scancode) => Translated::Key(keyboard.key(scancode, *pressed)),
+        PhysicalInput::Key { key, pressed, mods, .. } => match scancode(*key) {
+            Some(scancode) => {
+                let held = keyboard.hold(held(*mods), scancode);
+                Translated::Key(held, keyboard.key(scancode, *pressed))
+            }
             None => Translated::Pass,
         },
         PhysicalInput::Modifiers(_) => Translated::Pass,
@@ -25,6 +30,16 @@ pub fn translate(keyboard: &mut Keyboard, event: &PhysicalInput) -> Translated {
             keyboard.release_all();
             Translated::FocusLost
         }
+    }
+}
+
+/// ⌘ is the logo key on every platform; Rune's `cmd` is Ctrl off macOS.
+fn held(mods: Mods) -> Held {
+    Held {
+        shift: mods.shift,
+        control: mods.ctrl,
+        alt: mods.alt,
+        command: mods.logo,
     }
 }
 
@@ -202,7 +217,7 @@ mod tests {
         let sent: Vec<KeyOp> = events
             .iter()
             .flat_map(|e| match translate(&mut keyboard, e) {
-                Translated::Key(KeyOutcome::Send(ops)) => ops,
+                Translated::Key(held, KeyOutcome::Send(ops)) => held.into_iter().chain(ops).collect(),
                 Translated::Pass => Vec::new(),
                 other => panic!("{e:?} became {other:?}"),
             })

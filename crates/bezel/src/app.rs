@@ -99,6 +99,9 @@ pub struct Session {
     pub screen: Screen,
     /// A problem saving something for this Session, shown over it until dismissed.
     pub notice: Option<String>,
+    /// The save making the Credential this Session signed in with its Connection's, in flight,
+    /// and the Credential's name. Kept here so its reply finds the Session after it ends.
+    assigning: Option<(RequestId, String)>,
 }
 
 pub enum Place {
@@ -288,8 +291,6 @@ struct Signing {
     /// Assign the Credential to the Connection once signed in: it was saved from the sign-in
     /// sheet of a Connection that asks each time, so it stops asking.
     assign: bool,
-    /// The save making the Credential the Connection's, in flight.
-    assigning: Option<RequestId>,
 }
 
 /// A Session's status dot, in its Tab and the sidebar.
@@ -325,13 +326,12 @@ impl Session {
 
     /// Whether the Store reply with this ID is this Session's.
     fn awaits(&self, id: RequestId) -> bool {
+        if self.assigning.as_ref().is_some_and(|(assigning, _)| *assigning == id) {
+            return true;
+        }
         match &self.screen {
             Screen::Live(live) => {
-                live.trust == Trust::Remembering(id)
-                    || live
-                        .signing
-                        .as_ref()
-                        .is_some_and(|s| s.adding == Some(id) || s.assigning == Some(id))
+                live.trust == Trust::Remembering(id) || live.signing.as_ref().is_some_and(|s| s.adding == Some(id))
             }
             Screen::Retry(retry) => {
                 retry.adding == Some(id) || retry.saving.as_ref().is_some_and(|(saving, ..)| *saving == id)
@@ -521,6 +521,14 @@ impl Bezel {
     /// The reply to a change the Session `session` made.
     fn on_session_saved(&mut self, session: SessionId, id: RequestId, error: Option<String>) {
         let Some(s) = self.session_mut(session) else { return };
+        if let Some((_, credential)) = s.assigning.take_if(|(assigning, _)| *assigning == id) {
+            if let Some(e) = error {
+                s.notice = Some(format!(
+                    "{credential} was not saved as this connection's credential, so it will ask again. {e}"
+                ));
+            }
+            return;
+        }
         match &mut s.screen {
             Screen::Live(live) if live.trust == Trust::Remembering(id) => {
                 live.trust = match error {
@@ -535,16 +543,6 @@ impl Bezel {
             }
             Screen::Live(live) => {
                 let Some(signing) = &mut live.signing else { return };
-                if signing.assigning == Some(id) {
-                    signing.assigning = None;
-                    if let Some(e) = error {
-                        s.notice = Some(format!(
-                            "Signed in, but {} was not saved as this connection's credential, so it will ask again. {e}",
-                            signing.credential.name
-                        ));
-                    }
-                    return;
-                }
                 signing.adding = None;
                 match error {
                     None => self.assign_when_signed_in(session),
@@ -744,6 +742,7 @@ impl Bezel {
             place: Place::Tab,
             screen,
             notice: None,
+            assigning: None,
         });
         match opening {
             Opening::Tab => self.activate(id),
@@ -859,7 +858,6 @@ impl Bezel {
                         credential,
                         adding: None,
                         assign,
-                        assigning: None,
                     }),
                 },
             ),
@@ -888,12 +886,10 @@ impl Bezel {
             host: session.to.address.host.clone(),
             port: session.to.address.port,
         };
+        let name = signing.credential.name.clone();
         let request = self.apply(change);
-        if let Some(Screen::Live(Live {
-            signing: Some(signing), ..
-        })) = self.screen_mut(id)
-        {
-            signing.assigning = request;
+        if let Some(session) = self.session_mut(id) {
+            session.assigning = request.map(|request| (request, name));
         }
     }
 
@@ -963,7 +959,6 @@ impl Bezel {
                 credential,
                 adding: Some(adding),
                 assign,
-                assigning: None,
             })
         } else {
             None
@@ -1246,13 +1241,20 @@ impl Bezel {
             return false;
         };
         match keymap::translate(&mut live.keyboard, event) {
-            Translated::Key(KeyOutcome::Send(ops)) => {
-                if !ops.is_empty() {
-                    live.handle.input(Input::Keys(ops));
+            Translated::Key(held, outcome) => {
+                if !held.is_empty() {
+                    live.handle.input(Input::Keys(held));
                 }
-                true
+                match outcome {
+                    KeyOutcome::Send(ops) => {
+                        if !ops.is_empty() {
+                            live.handle.input(Input::Keys(ops));
+                        }
+                        true
+                    }
+                    KeyOutcome::Shortcut(shortcut) => self.shortcut(shortcut, tx),
+                }
             }
-            Translated::Key(KeyOutcome::Shortcut(shortcut)) => self.shortcut(shortcut, tx),
             Translated::Pass => false,
             Translated::FocusLost => {
                 live.handle.input(Input::ReleaseAll);
@@ -1365,6 +1367,7 @@ pub fn fixture_session(
             trust: Trust::Verified,
         }),
         notice: None,
+        assigning: None,
     }
 }
 

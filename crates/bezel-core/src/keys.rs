@@ -128,12 +128,46 @@ struct CommandChord {
     forwarded: Vec<Scancode>,
 }
 
+/// The modifiers the platform reports held as a key event arrives.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct Held {
+    pub shift: bool,
+    pub control: bool,
+    pub alt: bool,
+    pub command: bool,
+}
+
 impl Keyboard {
     pub fn new(setting: CommandKey) -> Self {
         Self {
             setting,
             ..Self::default()
         }
+    }
+
+    /// Catches up with modifiers held down before this keyboard saw them, such as ⌘ still held
+    /// from the ⌘2 that switched to this Session's Tab, so the next key makes the chord the
+    /// person is holding. `key` is the event's own key, whose modifier the event itself presses
+    /// or releases. Returns what to send for the presses; a release this keyboard missed is
+    /// left to the release of everything when the Session loses the keyboard.
+    pub fn hold(&mut self, held: Held, key: Scancode) -> Vec<KeyOp> {
+        let wanted = [
+            (Modifier::Shift, held.shift, Scancode::SHIFT_LEFT),
+            (Modifier::Control, held.control, Scancode::CONTROL_LEFT),
+            (Modifier::Alt, held.alt, Scancode::ALT_LEFT),
+            (Modifier::Command, held.command, Scancode::WINDOWS_LEFT),
+        ];
+        let mut ops = Vec::new();
+        for (m, down, press) in wanted {
+            if down
+                && modifier(key) != Some(m)
+                && !self.is_held(m)
+                && let KeyOutcome::Send(sent) = self.press(press)
+            {
+                ops.extend(sent);
+            }
+        }
+        ops
     }
 
     pub fn key(&mut self, key: Scancode, pressed: bool) -> KeyOutcome {
@@ -300,6 +334,36 @@ mod tests {
     const CMD: Scancode = Scancode::WINDOWS_LEFT;
     const CTRL: Scancode = Scancode::CONTROL_LEFT;
     const WIN: Scancode = Scancode::WINDOWS_LEFT;
+
+    #[test]
+    fn a_command_held_from_before_still_makes_a_shortcut() {
+        let command = Held {
+            command: true,
+            ..Held::default()
+        };
+        let mut k = Keyboard::new(CommandKey::MacShortcuts);
+        assert!(
+            k.hold(command, Scancode::new(0x04)).is_empty(),
+            "⌘ alone sends nothing yet"
+        );
+        assert_eq!(k.key(Scancode::new(0x04), true), KeyOutcome::Shortcut(Shortcut::Tab(3)));
+        let both = Held {
+            shift: true,
+            command: true,
+            ..Held::default()
+        };
+        let mut k = Keyboard::new(CommandKey::MacShortcuts);
+        assert_eq!(k.hold(both, Scancode::BRACKET_RIGHT), vec![Press(Scancode::SHIFT_LEFT)]);
+        assert_eq!(
+            k.key(Scancode::BRACKET_RIGHT, true),
+            KeyOutcome::Shortcut(Shortcut::NextTab)
+        );
+        assert!(k.hold(both, Scancode::BRACKET_RIGHT).is_empty(), "held once is enough");
+        // The event's own modifier is its own business.
+        let mut k = Keyboard::new(CommandKey::WindowsKey);
+        assert!(k.hold(command, WIN).is_empty());
+        assert_eq!(k.key(WIN, true), send(&[Press(WIN)]));
+    }
 
     fn send(ops: &[KeyOp]) -> KeyOutcome {
         KeyOutcome::Send(ops.to_vec())

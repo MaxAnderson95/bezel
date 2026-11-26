@@ -8,7 +8,7 @@ use rune::{El, Key, KeyEvent, TextEdit, Tx, col, el, row, text};
 use rune_kit::{Keybind, Kit, TextInput};
 use rune_theme_opencode::icons;
 
-use crate::app::{Bezel, Opening, Session, SessionId};
+use crate::app::{Bezel, Opening, Screen, Session, SessionId};
 use crate::manage::{Sheet, host_text};
 use crate::windows::Window;
 
@@ -88,7 +88,8 @@ pub fn rows(query: &str, sessions: &[Session], library: Option<&Snapshot>) -> Ve
     let needle = typed.to_lowercase();
     let hit = |texts: &[&str]| needle.is_empty() || texts.iter().any(|t| t.to_lowercase().contains(&needle));
     let mut rows = Vec::new();
-    for session in sessions {
+    // A Session that ended isn't open; its Connection's Saved row starts it again.
+    for session in sessions.iter().filter(|s| !matches!(s.screen, Screen::Ended(_))) {
         let host = &session.to.address.host;
         if hit(&[&session.to.name, host]) {
             rows.push(Row {

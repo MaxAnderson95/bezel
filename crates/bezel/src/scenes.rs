@@ -178,10 +178,9 @@ pub const SCENES: &[Scene] = &[
 ];
 
 fn session(id: u64, to: Destination, screen: Screen) -> Session {
-    Session {
-        screen,
-        ..fixture_session(id, to, Phase::Connecting, None)
-    }
+    let mut session = fixture_session(id, to, Phase::Connecting, None);
+    session.screen = screen;
+    session
 }
 
 fn connected(id: u64, connection: &Connection) -> Session {
