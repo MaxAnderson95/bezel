@@ -27,11 +27,10 @@ jobs:
           persist-credentials: false
 
       # Rune links libxkbcommon and libwayland-client on Linux (Rune's README, "Linux"); IronRDP's
-      # audio playback links ALSA through cpal. The runner has no GPU, so the golden renders use
-      # Mesa's software Vulkan driver, lavapipe.
+      # audio playback links ALSA through cpal.
       - name: Install Linux build dependencies
         if: runner.os == 'Linux'
-        run: sudo apt-get update && sudo apt-get install -y libxkbcommon-dev libwayland-dev libasound2-dev mesa-vulkan-drivers
+        run: sudo apt-get update && sudo apt-get install -y libxkbcommon-dev libwayland-dev libasound2-dev
 
       # With no name, rustup installs the toolchain rust-toolchain.toml pins.
       - name: Install toolchain
@@ -48,10 +47,11 @@ jobs:
       - name: Test
         run: cargo test --workspace --locked
 
+      # The golden test runs on macOS only (crates/bezel/tests/goldens.rs).
       - name: Upload renders that missed their goldens
-        if: failure()
+        if: failure() && runner.os == 'macOS'
         uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
         with:
-          name: golden-actual-${{ matrix.os }}
+          name: golden-actual
           path: target/tmp/golden-actual
           if-no-files-found: ignore
