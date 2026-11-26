@@ -16,7 +16,8 @@ mod view;
 mod windows;
 
 use app::Bezel;
-use rune::AppSpec;
+use bezel_core::keys::Shortcut;
+use rune::{AppSpec, MenuItem, Tx};
 use tracing::Level;
 use tracing_subscriber::filter::Targets;
 use tracing_subscriber::layer::SubscriberExt as _;
@@ -43,8 +44,9 @@ fn main() {
     if rune::is_headless() {
         return rune::run(spec);
     }
+    platform::quiet_system_edit_items();
     let (home, husk, main_window) = windows::home();
-    let app = rune::App::new(spec)
+    let mut app = rune::App::new(spec)
         .init(move || husk)
         .keep_running()
         .turn_scope(windows::enter, windows::leave)
@@ -52,8 +54,45 @@ fn main() {
         .on_quit_request(windows::on_quit_request)
         .on_reopen(windows::on_reopen)
         .on_window(move |window| *main_window.borrow_mut() = Some(window.clone()));
+    for item in menu_items() {
+        app = app.menu_item(item);
+    }
     home.borrow_mut().main = Some(app.handle());
     app.run();
+}
+
+/// A Bezel shortcut in the menu bar: its title, key equivalent and what it does.
+type Command = (&'static str, &'static str, Shortcut);
+
+/// In the app menu, where every Mac app keeps it.
+const SETTINGS: Command = ("Settings…", "cmd+comma", Shortcut::Settings);
+
+/// The Session menu, `None` for a separator.
+const SESSION: [Option<Command>; 7] = [
+    Some(("Connect…", "cmd+k", Shortcut::Palette)),
+    None,
+    Some(("Show Previous Tab", "shift+cmd+bracketleft", Shortcut::PreviousTab)),
+    Some(("Show Next Tab", "shift+cmd+bracketright", Shortcut::NextTab)),
+    None,
+    Some(("Toggle Sidebar", "ctrl+cmd+s", Shortcut::Sidebar)),
+    Some(("Toggle Full Screen", "ctrl+cmd+f", Shortcut::FullScreen)),
+];
+
+/// Bezel's menu items, beside the Edit and Window items every Rune app gets. Each lets the
+/// window see its keys first (`keys_first`), so over a Session's desktop the Session's keyboard
+/// takes the chord and nothing of it reaches Windows; a click runs it.
+fn menu_items() -> impl Iterator<Item = MenuItem<Bezel>> {
+    let item = |(title, keys, shortcut): Command| {
+        MenuItem::with_action(title, move |s: &mut Bezel, tx: &mut Tx| {
+            s.shortcut(shortcut, tx);
+        })
+        .key_equivalent(keys.parse().expect("a valid key equivalent"))
+        .keys_first()
+    };
+    std::iter::once(item(SETTINGS)).chain(SESSION.into_iter().map(move |entry| match entry {
+        Some(command) => item(command).menu("Session"),
+        None => MenuItem::separator().menu("Session"),
+    }))
 }
 
 /// A daily log in the platform log folder, keeping a week. IronRDP and the libraries under it
@@ -81,6 +120,36 @@ fn init_logging() {
                 .with(filter)
                 .with(tracing_subscriber::fmt::layer())
                 .init();
+        }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use bezel_core::keys::{CommandKey, KeyOutcome, Keyboard, Scancode};
+
+    use super::*;
+
+    /// Every menu key equivalent is the Bezel shortcut its item runs, so the menus claim no key
+    /// the Session should have.
+    #[test]
+    fn menu_keys_are_the_shortcuts_they_run() {
+        for (title, keys, shortcut) in std::iter::once(SETTINGS).chain(SESSION.into_iter().flatten()) {
+            let parsed: rune::Shortcut = keys.parse().unwrap();
+            let mods = parsed.modifiers();
+            let mut keyboard = Keyboard::new(CommandKey::MacShortcuts);
+            for (held, key) in [
+                (mods.shift, Scancode::SHIFT_LEFT),
+                (mods.ctrl, Scancode::CONTROL_LEFT),
+                (mods.alt, Scancode::ALT_LEFT),
+                (mods.logo, Scancode::WINDOWS_LEFT),
+            ] {
+                if held {
+                    keyboard.key(key, true);
+                }
+            }
+            let key = keymap::scancode(parsed.physical_key()).unwrap();
+            assert_eq!(keyboard.key(key, true), KeyOutcome::Shortcut(shortcut), "{title}");
         }
     }
 }

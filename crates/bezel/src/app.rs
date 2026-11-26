@@ -1,11 +1,14 @@
 //! The app's state, which every window shares (see `windows`): the Library, the Sessions in
 //! Tabs and Session windows, and what happens to them: opening Connections and New hosts,
-//! signing in, each Session's events, the certificate dialogs and the wrong-password prompt.
-//! Managing the Library (sheets, Groups, Credentials, dragging) is in `manage`.
+//! signing in, each Session's events, the certificate dialogs, the wrong-password prompt and
+//! the clipboard the Sessions share with the Mac. Managing the Library (sheets, Groups,
+//! Credentials, Settings, dragging) is in `manage`.
 
 use std::cell::RefCell;
+use std::path::PathBuf;
 use std::rc::Rc;
 use std::sync::mpsc;
+use std::time::{Duration, Instant};
 
 use bezel_core::address::Address;
 use bezel_core::keys::{KeyOutcome, Keyboard, Shortcut};
@@ -63,9 +66,25 @@ pub struct Bezel {
     next_id: u64,
     pub(crate) next_window: u64,
     last_username: String,
-    /// The app menu's Hide shortcuts no longer claim ⌘H and ⌥⌘H.
+    /// The menus claim no key the Session should have (see `platform::release_menu_keys`).
     menus_ready: bool,
     next_request: RequestId,
+    pasteboard: Pasteboard,
+    /// Text a Session copied, for the Mac's clipboard.
+    to_mac: Option<String>,
+    /// The data folder, made and waiting to be shown in Finder.
+    data_folder: Option<PathBuf>,
+}
+
+/// Bezel's watch on the Mac's clipboard while a Session is live to share it.
+#[derive(Default)]
+struct Pasteboard {
+    /// The change count the text was last read at.
+    seen: Option<u64>,
+    /// When the change count was last looked at.
+    checked: Option<Instant>,
+    /// The read in flight; an older one's text is stale.
+    reading: Option<RequestId>,
 }
 
 pub enum Library {
@@ -87,6 +106,10 @@ enum Message {
     /// From the engine with this ID, which one Session's `Live` names.
     Engine(u64, Event),
     Store(Reply),
+    /// The Mac clipboard's text, read for the request with this ID.
+    MacText(RequestId, Option<String>),
+    /// The data folder, made if it was missing.
+    DataFolder(Result<PathBuf, String>),
 }
 
 pub type SessionId = u64;
@@ -102,6 +125,8 @@ pub struct Session {
     /// The save making the Credential this Session signed in with its Connection's, in flight,
     /// and the Credential's name. Kept here so its reply finds the Session after it ends.
     assigning: Option<(RequestId, String)>,
+    /// Its audio is silenced, through every reconnect.
+    pub muted: bool,
 }
 
 pub enum Place {
@@ -238,6 +263,9 @@ pub struct Live {
     pub pointer: Pointer,
     pub certificate: Option<Prompt>,
     pub trust: Trust,
+    /// The clipboard text Windows has, as far as Bezel knows: the Mac's as last offered, or
+    /// what Windows copied. `None` when it holds no text.
+    offered: Option<String>,
 }
 
 impl Live {
@@ -381,6 +409,9 @@ impl Bezel {
             last_username: String::new(),
             menus_ready: false,
             next_request: 0,
+            pasteboard: Pasteboard::default(),
+            to_mac: None,
+            data_folder: None,
         }
     }
 
@@ -407,11 +438,13 @@ impl Bezel {
     /// Runs before every frame; true when something changed.
     pub fn poll(&mut self, _clock: f64, tx: &mut Tx) -> bool {
         if !self.menus_ready {
-            self.menus_ready = platform::release_hide_shortcuts();
+            self.menus_ready = platform::release_menu_keys();
         }
         if self.drain() {
             self.changed();
         }
+        self.share_clipboard(tx);
+        self.show_data_folder(tx);
         self.title_window(tx);
         let fresh = self.here.seen != self.generation;
         self.here.seen = self.generation;
@@ -426,9 +459,100 @@ impl Bezel {
             match message {
                 Message::Store(reply) => self.on_store(reply),
                 Message::Engine(engine, event) => self.on_engine(engine, event),
+                Message::MacText(id, text) => {
+                    if self.pasteboard.reading == Some(id) {
+                        self.pasteboard.reading = None;
+                        self.mac_copied(text);
+                    }
+                }
+                Message::DataFolder(Ok(folder)) => self.data_folder = Some(folder),
+                Message::DataFolder(Err(e)) => self.folder_failed(e),
             }
         }
         changed
+    }
+
+    /// Copies what a Session copied to the Mac's clipboard, and while any Session is live,
+    /// offers each one the Mac's text whenever its clipboard changes. The change count costs
+    /// nothing to read, so it is checked a few times a second, however often the desktop
+    /// redraws; the text alone is read, off this thread, only when the count moves.
+    fn share_clipboard(&mut self, tx: &mut Tx) {
+        if let Some(text) = self.to_mac.take() {
+            tx.copy(text);
+        }
+        if !self.sessions.iter().any(|s| s.live().is_some()) {
+            self.pasteboard = Pasteboard::default();
+            return;
+        }
+        tx.wake_after(CLIPBOARD_CHECK);
+        let now = Instant::now();
+        if self.pasteboard.checked.is_some_and(|at| now - at < CLIPBOARD_CHECK) {
+            return;
+        }
+        self.pasteboard.checked = Some(now);
+        let changes = rune::clipboard::revision();
+        if changes.is_none() || changes == self.pasteboard.seen {
+            return;
+        }
+        let id = self.request();
+        let (outbox, alarm) = (self.outbox.clone(), self.alarm.clone());
+        let read = std::thread::Builder::new().name("mac clipboard".into()).spawn(move || {
+            let _ = outbox.send(Message::MacText(id, platform::clipboard_text()));
+            alarm.ring();
+        });
+        if read.is_ok() {
+            self.pasteboard.seen = changes;
+            self.pasteboard.reading = Some(id);
+        }
+    }
+
+    /// The Mac's clipboard holds `text`, or no text: each live Session's Windows is offered it
+    /// unless Windows has it already, as when it copied it.
+    pub(crate) fn mac_copied(&mut self, text: Option<String>) {
+        for session in &mut self.sessions {
+            if let Screen::Live(live) = &mut session.screen
+                && live.offered != text
+            {
+                live.handle.set_clipboard(text.clone());
+                live.offered = text.clone();
+            }
+        }
+    }
+
+    /// Open data folder: the folder is made first, off this thread, as a new Library has none
+    /// until its first save; Finder shows it once it exists.
+    pub fn open_data_folder(&mut self) {
+        self.open_folder(platform::data_dir());
+    }
+
+    fn open_folder(&mut self, folder: PathBuf) {
+        let (outbox, alarm) = (self.outbox.clone(), self.alarm.clone());
+        let made = std::thread::Builder::new().name("data folder".into()).spawn(move || {
+            let made = std::fs::create_dir_all(&folder)
+                .map(|()| folder.clone())
+                .map_err(|e| format!("Bezel couldn't make its data folder {}. {e}", folder.display()));
+            let _ = outbox.send(Message::DataFolder(made));
+            alarm.ring();
+        });
+        if let Err(e) = made {
+            self.folder_failed(format!("Bezel couldn't open its data folder. {e}"));
+        }
+    }
+
+    /// Shows the data folder in Finder once it exists.
+    fn show_data_folder(&mut self, tx: &mut Tx) {
+        let Some(folder) = self.data_folder.take() else { return };
+        if let Err(e) = tx.open_path(&folder) {
+            self.folder_failed(format!("Bezel couldn't open {}. {e}", folder.display()));
+        }
+    }
+
+    /// Says why the data folder can't be shown: in the Settings sheet when it is open.
+    fn folder_failed(&mut self, message: String) {
+        match &mut self.sheet {
+            Some(Sheet::Settings(sheet)) => sheet.error = Some(message),
+            _ => self.notice = Some(message),
+        }
     }
 
     /// Light or dark from the Library's Appearance setting, else the system's.
@@ -507,6 +631,7 @@ impl Bezel {
         // Bezel remembered, which the next Session must expect, and every open form follows it.
         self.library = Library::Ready(snapshot);
         self.follow_library();
+        self.follow_command_key();
         if let Some(session) = self.sessions.iter().find(|s| s.awaits(id)).map(|s| s.id) {
             return self.on_session_saved(session, id, error);
         }
@@ -612,6 +737,22 @@ impl Bezel {
         let username = self.last_username.clone();
         if let Some(screen) = self.screen_mut(session) {
             *screen = Screen::SignIn(SignIn::new(username, error));
+        }
+    }
+
+    /// Every live Session's keyboard takes the ⌘ key setting as soon as it changes, letting go
+    /// of what the old one held.
+    fn follow_command_key(&mut self) {
+        let Some(setting) = self.library.ready().map(|s| s.settings.command_key) else {
+            return;
+        };
+        for session in &mut self.sessions {
+            if let Screen::Live(live) = &mut session.screen
+                && live.keyboard.command_key() != setting
+            {
+                live.keyboard = Keyboard::new(setting);
+                live.handle.input(Input::ReleaseAll);
+            }
         }
     }
 
@@ -743,6 +884,7 @@ impl Bezel {
             screen,
             notice: None,
             assigning: None,
+            muted: false,
         });
         match opening {
             Opening::Tab => self.activate(id),
@@ -997,6 +1139,7 @@ impl Bezel {
             ),
             Library::Loading | Library::Failed(_) => (None, Default::default()),
         };
+        let muted = session.muted;
         let target = Target {
             host: to.address.host.clone(),
             port: to.address.port,
@@ -1017,6 +1160,9 @@ impl Bezel {
                 alarm.ring();
             },
         );
+        if muted {
+            handle.set_muted(true);
+        }
         if let Some(session) = self.session_mut(id) {
             session.screen = Screen::Live(Live {
                 engine,
@@ -1028,8 +1174,11 @@ impl Bezel {
                 pointer: Pointer::Default,
                 certificate: None,
                 trust: Trust::Verified,
+                offered: None,
             });
         }
+        // Read the Mac's clipboard again, to offer the new Session what it holds.
+        self.pasteboard = Pasteboard::default();
     }
 
     /// An event from the engine `engine`, for the Session it belongs to.
@@ -1053,6 +1202,12 @@ impl Bezel {
         match event {
             Event::State(State::Connecting) => live.state = Phase::Connecting,
             Event::State(State::Connected { width, height }) => {
+                // The engine dropped what was typed while not connected, and Windows starts a
+                // (re)connection with nothing held: the keyboard starts over too, and the next
+                // key's modifier snapshot presses whatever is still held.
+                if !matches!(live.state, Phase::Connected { .. }) {
+                    live.keyboard = Keyboard::new(live.keyboard.command_key());
+                }
                 live.state = Phase::Connected { width, height };
                 self.assign_when_signed_in(id);
             }
@@ -1071,6 +1226,12 @@ impl Bezel {
                     remember,
                     confirming: false,
                 })
+            }
+            Event::Clipboard(text) => {
+                live.offered = text.clone();
+                if text.is_some() {
+                    self.to_mac = text;
+                }
             }
             Event::SignInFailed { wrong_password, ended } => {
                 session.screen = match live.signing.clone() {
@@ -1193,6 +1354,22 @@ impl Bezel {
         }
     }
 
+    /// Reconnect on a Session that ended: it signs in again as it did when it opened.
+    pub fn reconnect(&mut self, id: SessionId) {
+        if matches!(self.session(id).map(|s| &s.screen), Some(Screen::Ended(_))) {
+            self.start(id);
+        }
+    }
+
+    /// Mute or Unmute in the … menu.
+    pub fn toggle_mute(&mut self, id: SessionId) {
+        let Some(session) = self.session_mut(id) else { return };
+        session.muted = !session.muted;
+        if let Screen::Live(live) = &session.screen {
+            live.handle.set_muted(session.muted);
+        }
+    }
+
     pub fn send_ctrl_alt_del(&mut self, id: SessionId) {
         if let Some(live) = self.session(id).and_then(Session::live) {
             live.handle.send_ctrl_alt_del();
@@ -1267,9 +1444,9 @@ impl Bezel {
         }
     }
 
-    /// A Bezel shortcut in this window. True when Bezel took it; ⌘Q and ⌘, are left to Rune
-    /// and the menus.
-    fn shortcut(&mut self, shortcut: Shortcut, tx: &mut Tx) -> bool {
+    /// A Bezel shortcut in this window, from its keys or its menu item. True when Bezel took
+    /// it; ⌘Q is left to the app menu.
+    pub(crate) fn shortcut(&mut self, shortcut: Shortcut, tx: &mut Tx) -> bool {
         match shortcut {
             Shortcut::Palette => self.open_palette(tx),
             Shortcut::Close => match self.current() {
@@ -1281,7 +1458,9 @@ impl Bezel {
             Shortcut::PreviousTab => self.step_tab(-1),
             Shortcut::NextTab => self.step_tab(1),
             Shortcut::Tab(n) => self.nth_tab(usize::from(n)),
-            Shortcut::Quit | Shortcut::Settings => return false,
+            Shortcut::Settings => self.open_settings(),
+            // The app menu's Quit takes ⌘Q before any window sees it.
+            Shortcut::Quit => return false,
         }
         true
     }
@@ -1318,6 +1497,7 @@ impl Bezel {
             Key::Command('f' | '\u{6}') if mods.ctrl && !mods.shift && !mods.alt => Shortcut::FullScreen,
             Key::Command('k' | 't') if !mods.ctrl && !mods.shift && !mods.alt => Shortcut::Palette,
             Key::Command('w') if !mods.ctrl && !mods.shift && !mods.alt => Shortcut::Close,
+            Key::Command(',') if !mods.ctrl && !mods.shift && !mods.alt => Shortcut::Settings,
             Key::Command('[' | '{') if mods.shift && !mods.ctrl => Shortcut::PreviousTab,
             Key::Command(']' | '}') if mods.shift && !mods.ctrl => Shortcut::NextTab,
             Key::Command(c @ '1'..='9') if !mods.ctrl && !mods.shift && !mods.alt => Shortcut::Tab(c as u8 - b'0'),
@@ -1326,6 +1506,9 @@ impl Bezel {
         self.shortcut(shortcut, tx)
     }
 }
+
+/// How often to look for a change to the Mac's clipboard while a Session is live.
+const CLIPBOARD_CHECK: Duration = Duration::from_millis(250);
 
 /// Shown on the sign-in sheet when the Credential a sign-in needs is gone.
 const DELETED: &str = "The credential was deleted. Sign in another way.";
@@ -1369,9 +1552,11 @@ pub fn fixture_session(
                 confirming: false,
             }),
             trust: Trust::Verified,
+            offered: None,
         }),
         notice: None,
         assigning: None,
+        muted: false,
     }
 }
 

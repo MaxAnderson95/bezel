@@ -53,3 +53,15 @@ Use `scripts/bundle.sh` and open `Bezel.app` (the bundle declares Retina support
 - [ ] ⌃⌘F: the sidebar and tab row hide; the pointer at the top edge shows the tab row; ⌘K and tab switching still work.
 - [ ] The Main window's close button hides it and its Sessions keep running; the Dock icon brings it back. (A utility that quits apps when their last window closes, such as Vorssaint, will send Bezel a quit instead; with Sessions open Bezel then asks.)
 - [ ] ⌘Q with Sessions open asks "Disconnect 3 Sessions and quit?" once; with none it quits at once.
+
+## M4: clipboard, audio, reconnect and settings
+
+- [ ] Copy text on the Mac, ⌘V in Notepad in a Session: it pastes. Copy in Notepad with ⌘C, ⌘V in a Mac app: it pastes. With two Sessions open, text copied in one pastes in the other.
+- [ ] Copy text on the Mac and switch straight to a Session: ⌘V pastes the new text, not the one before.
+- [ ] Copy an image in Windows: the Mac's clipboard keeps what it had. Copy an image on the Mac: ⌘V in Windows pastes nothing.
+- [ ] Play a sound in Windows (Settings, System, Sound, test): it plays on the Mac. Mute in the … menu silences that Session only and shows as ticked; Unmute brings it back, and a muted Session stays muted after a reconnect.
+- [ ] Turn Wi-Fi off for about 10 seconds while connected: the desktop dims with "Reconnecting…" and an amber dot, and comes back on its own with the same Windows session, the clipboard and the mute as they were.
+- [ ] Turn Wi-Fi off for a minute: about 30 seconds after the drop the Tab says the connection was lost, and Reconnect signs in again (asking for the password of a one-off sign-in).
+- [ ] Every shortcut in the spec's list works over the desktop and away from it, and none of them reaches Windows; the Session menu and Settings… in the app menu show them. ⌘H, ⌘M, ⌘Z and ⌥⌘H reach Windows over the desktop. ⌘Q with ⌘ released after Cancel opens no Start menu.
+- [ ] Releasing the left Shift while the right Shift, held from before the Tab switch, is still down: a click is still a Shift-click.
+- [ ] Settings (⌘, the sidebar's gear, or Settings… in the palette): Appearance switches light and dark at once; "⌘ is the Windows key" makes ⌘C reach Windows as Windows+C in the open Sessions; Remember certificates by default ticks Remember this certificate; Open data folder shows `bezel.toml` in Finder. Quit and relaunch: every setting is as it was left.

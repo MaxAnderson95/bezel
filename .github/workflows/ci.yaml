@@ -26,10 +26,11 @@ jobs:
         with:
           persist-credentials: false
 
-      # Rune links libxkbcommon and libwayland-client on Linux (Rune's README, "Linux").
+      # Rune links libxkbcommon and libwayland-client on Linux (Rune's README, "Linux"); IronRDP's
+      # audio playback links ALSA through cpal.
       - name: Install Linux build dependencies
         if: runner.os == 'Linux'
-        run: sudo apt-get update && sudo apt-get install -y libxkbcommon-dev libwayland-dev
+        run: sudo apt-get update && sudo apt-get install -y libxkbcommon-dev libwayland-dev libasound2-dev
 
       # With no name, rustup installs the toolchain rust-toolchain.toml pins.
       - name: Install toolchain

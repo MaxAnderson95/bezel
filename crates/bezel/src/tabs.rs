@@ -176,14 +176,19 @@ fn main_actions(session: &Session, k: &Kit) -> El {
         .child(more(session, k))
 }
 
-/// The … menu: Disconnect, Save as connection for a New host, and Copy details.
+/// The … menu: Mute, Disconnect, Save as connection for a New host, and Copy details.
+/// IronRDP has no way to sign out of Windows, so there is no Sign out item.
 fn more(session: &Session, k: &Kit) -> El {
     let id = session.id;
     let new_host = session.to.connection.is_none();
+    let muted = session.muted;
     let details = details(session);
     icon_button(&icons::OUTLINE_DOTS, "More")
         .on_press_tx(move |_: &mut Bezel, tx: &mut Tx| {
-            let mut menu = PopupMenu::new().item(PopupItem::new("disconnect", "Disconnect"));
+            let mut menu = PopupMenu::new()
+                .item(PopupItem::new("mute", "Mute").checked(muted))
+                .separator()
+                .item(PopupItem::new("disconnect", "Disconnect"));
             if new_host {
                 menu = menu.item(PopupItem::new("save", "Save as connection…"));
             }
@@ -193,6 +198,7 @@ fn more(session: &Session, k: &Kit) -> El {
                 menu,
                 format!("more-{id}"),
                 move |s: &mut Bezel, picked, tx| match picked {
+                    Some("mute") => s.toggle_mute(id),
                     Some("disconnect") => s.close(id),
                     Some("save") => s.save_as_connection(id),
                     Some("copy") => tx.copy(details.clone()),

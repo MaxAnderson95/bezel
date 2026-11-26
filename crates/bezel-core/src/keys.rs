@@ -192,7 +192,8 @@ impl Keyboard {
 
     /// A new modifier snapshot from the platform: every modifier pressed on its word (`hold`)
     /// that it no longer reports held is released, whichever side's key-up let it go. Never
-    /// presses anything; a key seen going down is released by its own key-up.
+    /// presses anything; a key seen going down is released by its own key-up, unless it is that
+    /// stand-in too.
     pub fn let_go(&mut self, held: Held) -> Vec<KeyOp> {
         wanted(held)
             .into_iter()
@@ -219,12 +220,19 @@ impl Keyboard {
             return KeyOutcome::Send(vec![KeyOp::Press(key), KeyOp::Release(key)]);
         }
         if pressed {
-            // Seen going down now, the key is the person's own and is released by its key-up.
-            self.inferred.retain(|k| *k != key);
             self.press(key)
+        } else if self.inferred.contains(&key) {
+            // The key is also the stand-in for a modifier held from before, which may be the
+            // other side's key and still down: Windows has one key for both, so only the
+            // modifier change after this key-up (`let_go`) can say whether to release it.
+            KeyOutcome::Send(Vec::new())
         } else {
             KeyOutcome::Send(self.release(key))
         }
+    }
+
+    pub fn command_key(&self) -> CommandKey {
+        self.setting
     }
 
     /// Releases everything held, for when the Session loses the keyboard.
@@ -551,6 +559,24 @@ mod tests {
         assert!(remote.shifted());
         event(&mut k, &mut remote, Scancode::SHIFT_RIGHT, false, held(false, false));
         assert_eq!(remote.0, vec![]);
+    }
+
+    /// Both ⇧ keys held from before (the left key stands in for them), then let go in either
+    /// order: Windows keeps ⇧ down until the last one goes up, so a click in between is still a
+    /// ⇧-click.
+    #[test]
+    fn shift_held_on_both_sides_from_before_stays_down_until_the_last_is_let_go() {
+        const SHIFTS: [Scancode; 2] = [Scancode::SHIFT_LEFT, Scancode::SHIFT_RIGHT];
+        for (first, last) in [(SHIFTS[0], SHIFTS[1]), (SHIFTS[1], SHIFTS[0])] {
+            let mut k = Keyboard::new(CommandKey::MacShortcuts);
+            let mut remote = Remote::holding(held(true, false));
+            event(&mut k, &mut remote, A, true, held(true, false));
+            event(&mut k, &mut remote, A, false, held(true, false));
+            event(&mut k, &mut remote, first, false, held(true, false));
+            assert!(remote.shifted(), "{first:?} let go first: the other ⇧ is still down");
+            event(&mut k, &mut remote, last, false, held(false, false));
+            assert_eq!(remote.0, vec![], "{first:?} let go first: nothing left down");
+        }
     }
 
     #[test]

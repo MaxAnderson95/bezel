@@ -29,6 +29,15 @@ pub const SCENES: &[Scene] = &[
             session(1, Destination::new_host(address("dc01.corp.lan")), Screen::Ended(ended)),
         );
     }),
+    ("lost", |s| {
+        s.library = Library::Ready(library());
+        let ended = Ended {
+            message: "The connection to dc01.corp.lan was lost and did not come back".into(),
+            details: "connection reset by peer".into(),
+            by_user: false,
+        };
+        tab(s, session(1, Destination::connection(&dc01()), Screen::Ended(ended)));
+    }),
     ("first-run", |s| s.library = Library::Ready(Snapshot::default())),
     ("library-error", |s| {
         s.library = Library::Failed(
@@ -57,6 +66,12 @@ pub const SCENES: &[Scene] = &[
         s.here.palette.open = true;
         s.here.palette.query = TextEdit::new("dc");
         s.here.palette.selected = 1;
+    }),
+    ("palette-manage", |s| {
+        s.library = Library::Ready(library());
+        tabs(s);
+        s.here.palette.open = true;
+        s.here.palette.query = TextEdit::new("set");
     }),
     ("palette-new-host", |s| {
         s.library = Library::Ready(library());
@@ -174,6 +189,11 @@ pub const SCENES: &[Scene] = &[
     ("certificates", |s| {
         s.library = Library::Ready(library());
         s.open_certificates();
+    }),
+    ("settings", |s| {
+        s.library = Library::Ready(library());
+        tab(s, connected(1, &dc01()));
+        s.open_settings();
     }),
 ];
 

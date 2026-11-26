@@ -7,15 +7,20 @@
 //! the app trusts it the engine connects again with the fingerprint trusted for the Session. No
 //! thread blocks, nothing times out, and the server never holds a half-open handshake while a
 //! dialog is up.
+//!
+//! When the link drops, IronRDP reconnects with the server's auto-reconnect cookie and asks
+//! before each try; the engine lets it try for `RECONNECT_FOR` from the drop, then the Session
+//! ends with the reason.
 
 use std::pin::Pin;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex, PoisonError};
 use std::time::Duration;
 
 use bezel_core::trust::{Certificate, CertificateError, Decision, Question, SessionTrust};
 use ironrdp_client::config::{Config, ConfigBuilder, Destination};
 use ironrdp_client::output_channel::{OutputEventReceiver, output_channel};
-use ironrdp_client::rdp::{RdpClient, RdpInputEvent, RdpInputSender, RdpOutputEvent};
+use ironrdp_client::rdp::{AutoReconnectDecision, RdpClient, RdpInputEvent, RdpInputSender, RdpOutputEvent};
 use ironrdp_input::{Database, MousePosition, Operation};
 use ironrdp_pdu::rdp::capability_sets::MajorPlatformType;
 use rune_image::Pixels;
@@ -24,17 +29,24 @@ use tokio::sync::{mpsc, oneshot};
 use tokio::time::Instant;
 use tracing::{debug, info, warn};
 
+use crate::audio;
+use crate::clipboard::Clipboard;
 use crate::failure::{self, Ended, Failure};
 use crate::framebuffer::{Framebuffer, Region};
 use crate::input::{self, Outbox, Wheel};
 use crate::retina::Desktop;
 use crate::{Answer, Auth, CertificateRequest, Command, Event, Input, Pointer, PointerShape, State, Target, View};
 
-type Emit = Arc<dyn Fn(Event) + Send + Sync>;
+pub(crate) type Emit = Arc<dyn Fn(Event) + Send + Sync>;
 
 const RESIZE_DEBOUNCE: Duration = Duration::from_millis(250);
 /// How soon to offer queued input to IronRDP again after its queue was full.
 const INPUT_RETRY: Duration = Duration::from_millis(5);
+/// How long after the link drops IronRDP may keep trying to reconnect.
+const RECONNECT_FOR: Duration = Duration::from_secs(30);
+/// More tries than fit in `RECONNECT_FOR`: IronRDP waits a second before each, so the time
+/// limit is what ends them.
+const RECONNECT_TRIES: u32 = 60;
 
 pub(crate) fn spawn(
     target: Target,
@@ -67,6 +79,8 @@ pub(crate) fn spawn(
                 view: target.view,
                 target,
                 auth,
+                clipboard: Clipboard::new(emit.clone()),
+                muted: Arc::default(),
                 emit,
                 commands,
                 framebuffer: Framebuffer::new(pixels),
@@ -91,6 +105,9 @@ struct Engine {
     trust: Arc<Mutex<SessionTrust>>,
     /// The latest content area the app reported.
     view: View,
+    clipboard: Clipboard,
+    /// Shared with every connection's sound channel.
+    muted: Arc<AtomicBool>,
 }
 
 enum Outcome {
@@ -140,7 +157,7 @@ impl Engine {
                     command = self.commands.recv() => match command {
                         None | Some(Command::Disconnect) => break None,
                         Some(Command::Resize(view)) => self.view = view,
-                        Some(Command::Input(_) | Command::CtrlAltDel) => {}
+                        Some(command) => self.keep(command),
                     },
                 }
             };
@@ -174,9 +191,16 @@ impl Engine {
         };
         info!(host = %self.target.host, port = self.target.port, ?requested, "connecting");
         let (sender, mut receiver) = output_channel(64);
-        let client = RdpClient::new(config, sender).with_desktop_updates();
+        let client = RdpClient::new(config, sender)
+            .with_desktop_updates()
+            .with_auto_reconnect(RECONNECT_TRIES);
+        let input = client.input_sender();
+        let cliprdr = input.clone();
+        let client = client.with_cliprdr_backend_factory(self.clipboard.factory(Arc::new(move |message| {
+            let _ = cliprdr.send_clipboard(message);
+        })));
         let mut attempt = Attempt {
-            input: client.input_sender(),
+            input,
             outbox: Outbox::default(),
             database: Database::new(),
             wheel: Wheel::default(),
@@ -186,6 +210,8 @@ impl Engine {
             connected: false,
             resize_at: None,
             pending,
+            dropped: None,
+            size: (0, 0),
         };
         // Polled here rather than spawned: IronRDP's client future is not `Send`.
         let run = client.run();
@@ -207,6 +233,12 @@ impl Engine {
             let resize = sleep_until(attempt.resize_at);
             tokio::select! {
                 () = &mut run, if running => running = false,
+                // IronRDP checks with the engine only between tries, and a server can take a
+                // try's connection and then say nothing.
+                () = sleep_until(attempt.dropped.map(|at| at + RECONNECT_FOR)) => {
+                    info!(host = %self.target.host, "the connection did not come back in time");
+                    return Outcome::Ended(disconnected(failure::not_back(None, &self.target.host)));
+                }
                 () = sleep_until(attempt.retry_at) => {
                     attempt.retry_at = None;
                     attempt.flush();
@@ -240,7 +272,7 @@ impl Engine {
                         attempt.send(ops);
                     }
                     Some(Command::CtrlAltDel) if attempt.connected => attempt.send(input::CTRL_ALT_DEL.into_iter().map(input::key).collect()),
-                    Some(Command::Input(_) | Command::CtrlAltDel) => {}
+                    Some(command) => self.keep(command),
                 },
                 () = resize => {
                     attempt.resize_at = None;
@@ -256,8 +288,11 @@ impl Engine {
             RdpOutputEvent::Connected => {
                 info!(%host, "connected");
                 attempt.connected = true;
+                // Also how a reconnect ends whose cookie the server refused but whose sign-in it
+                // took.
+                attempt.dropped = None;
                 let Desktop { width, height, .. } = attempt.requested;
-                self.emit(Event::State(State::Connected { width, height }));
+                self.connected(attempt, width, height);
                 // The window may have changed while connecting.
                 attempt.resize_to(Desktop::for_view(self.view));
             }
@@ -270,10 +305,7 @@ impl Engine {
                 };
                 if self.framebuffer.apply(width.get(), height.get(), region, &buffer) {
                     debug!(width = width.get(), height = height.get(), "desktop size");
-                    self.emit(Event::State(State::Connected {
-                        width: width.get(),
-                        height: height.get(),
-                    }));
+                    self.connected(attempt, width.get(), height.get());
                 }
             }
             RdpOutputEvent::DisplayResizeFallback(reason) => {
@@ -285,6 +317,41 @@ impl Engine {
                 if !Desktop::for_view(self.view).same_scale(&attempt.configured) {
                     return Some(Outcome::Reconnect);
                 }
+                attempt.configured = Desktop {
+                    width: attempt.requested.width,
+                    height: attempt.requested.height,
+                    ..attempt.configured
+                };
+            }
+            RdpOutputEvent::AutoReconnecting {
+                attempt: tries,
+                response,
+                ..
+            } => {
+                if attempt.dropped.is_none() {
+                    info!(%host, "the connection dropped; reconnecting");
+                    attempt.lose_link();
+                    self.emit(Event::State(State::Reconnecting));
+                }
+                let since = *attempt.dropped.get_or_insert_with(Instant::now);
+                // A certificate that needs a decision ends the tries so the person is asked.
+                let asking = attempt.pending.lock().unwrap_or_else(PoisonError::into_inner).is_some();
+                let go = !asking && since.elapsed() < RECONNECT_FOR;
+                debug!(%host, tries, go, "reconnect");
+                let _ = response.send(match go {
+                    true => AutoReconnectDecision::Continue,
+                    false => AutoReconnectDecision::Stop,
+                });
+            }
+            RdpOutputEvent::AutoReconnected => {
+                info!(%host, "reconnected");
+                attempt.dropped = None;
+                attempt.connected = true;
+                // The size the app last heard; a desktop of another size says so with its first
+                // update.
+                let (width, height) = attempt.size;
+                self.connected(attempt, width, height);
+                attempt.resize_to(Desktop::for_view(self.view));
             }
             RdpOutputEvent::PointerDefault => self.emit(Event::Pointer(Pointer::Default)),
             RdpOutputEvent::PointerHidden => self.emit(Event::Pointer(Pointer::Hidden)),
@@ -312,6 +379,11 @@ impl Engine {
                 return Some(Outcome::Ended(
                     match failure::classify(&error, host, self.target.port) {
                         Failure::SignIn { wrong_password, ended } => Event::SignInFailed { wrong_password, ended },
+                        // The last try to reconnect failed: the drop is what the person needs
+                        // to hear about.
+                        Failure::Ended(_) if attempt.dropped.is_some() => {
+                            disconnected(failure::not_back(Some(&error), host))
+                        }
                         Failure::Ended(ended) => disconnected(ended),
                     },
                 ));
@@ -324,7 +396,10 @@ impl Engine {
                     Ok(Reason::Other(why)) => Ended::plain(format!("{host} ended the session: {why}")),
                     Err(error) => {
                         warn!(%host, error = %error.report(), "session lost");
-                        failure::lost(&error, host)
+                        match attempt.dropped {
+                            Some(_) => failure::not_back(Some(&error), host),
+                            None => failure::lost(&error, host),
+                        }
                     }
                 };
                 info!(%host, message = %ended.message, "session ended");
@@ -335,6 +410,20 @@ impl Engine {
             other => debug!(event = ?std::mem::discriminant(&other), "ignored output event"),
         }
         None
+    }
+
+    fn connected(&self, attempt: &mut Attempt, width: u16, height: u16) {
+        attempt.size = (width, height);
+        self.emit(Event::State(State::Connected { width, height }));
+    }
+
+    /// A command with nothing to send now: the engine keeps what it says for the connection.
+    fn keep(&self, command: Command) {
+        match command {
+            Command::Clipboard(text) => self.clipboard.set(text),
+            Command::Mute(muted) => self.muted.store(muted, Ordering::Relaxed),
+            Command::Input(_) | Command::Resize(_) | Command::CtrlAltDel | Command::Disconnect => {}
+        }
     }
 
     fn operations(&self, attempt: &mut Attempt, input: Input) -> Vec<Operation> {
@@ -386,6 +475,7 @@ impl Engine {
                 }
             }
         });
+        let muted = self.muted.clone();
         let (username, domain) = self.auth.username.protocol_parts();
         let mut builder = ConfigBuilder::new()
             .with_destination(Destination::from_parts(host.clone(), *port))
@@ -409,7 +499,8 @@ impl Engine {
             .with_desktop_height(desktop.height)
             .with_desktop_scale_factor(desktop.desktop_scale)
             .with_device_scale_factor(desktop.device_scale)
-            .with_tcp_connect_attempt_timeout(Duration::from_secs(10));
+            .with_tcp_connect_attempt_timeout(Duration::from_secs(10))
+            .with_static_channel(move |_| Some(audio::channel(muted.clone())));
         if let Some(domain) = domain {
             builder = builder.with_domain(domain);
         }
@@ -435,9 +526,23 @@ struct Attempt {
     connected: bool,
     resize_at: Option<Instant>,
     pending: Pending,
+    /// When the link dropped, while IronRDP reconnects.
+    dropped: Option<Instant>,
+    /// The remote desktop's size as the app last heard it.
+    size: (u16, u16),
 }
 
 impl Attempt {
+    /// The link dropped: input waits for the reconnect, which starts the server from no keys
+    /// held and at the size IronRDP's configuration asks for.
+    fn lose_link(&mut self) {
+        self.connected = false;
+        self.outbox = Outbox::default();
+        self.retry_at = None;
+        self.database = Database::new();
+        self.requested = self.configured;
+    }
+
     fn send(&mut self, ops: Vec<Operation>) {
         if !ops.is_empty() {
             self.outbox.push(self.database.apply(ops));

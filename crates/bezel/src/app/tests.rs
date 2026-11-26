@@ -1,13 +1,13 @@
 use std::sync::Arc;
 use std::time::Duration;
 
-use bezel_core::keys::{Keyboard, Scancode};
-use bezel_core::library::{Group, GroupId, Library as Store_};
+use bezel_core::keys::{CommandKey, Keyboard, Scancode};
+use bezel_core::library::{Group, GroupId, Library as Store_, Setting};
 use bezel_core::secrets::MemorySecrets;
 use rune::{Env, Mods, Runtime};
 
 use super::*;
-use crate::manage::{Delete, Selected};
+use crate::manage::{Delete, Selected, Sheet};
 
 /// A Bezel whose Library is a file in a temporary folder, holding the Groups Infrastructure
 /// and File servers, the Credential Domain admin (password "old") used by dc01 and dc02, and
@@ -1254,4 +1254,201 @@ fn the_palette_lists_only_sessions_still_open() {
     bezel.choose(index, crate::palette::How::Return);
     assert_eq!(bezel.active, Some(ended));
     assert!(!matches!(screen(&bezel, ended), Screen::Ended(_)));
+}
+
+/// The clipboard text the live Session's Windows has, as Bezel knows it.
+fn offered(bezel: &Bezel, id: SessionId) -> Option<&str> {
+    match screen(bezel, id) {
+        Screen::Live(live) => live.offered.as_deref(),
+        _ => panic!("not live"),
+    }
+}
+
+#[test]
+fn text_copied_in_one_session_reaches_the_mac_and_every_other_session() {
+    let Fixture { mut bezel, _alive, .. } = fixture();
+    let dc01 = live_tab(&mut bezel, "n_dc01", None, 701);
+    let dc02 = live_tab(&mut bezel, "n_dc02", None, 702);
+    bezel.mac_copied(Some("copied on the Mac".into()));
+    assert_eq!(offered(&bezel, dc01), Some("copied on the Mac"));
+    assert_eq!(offered(&bezel, dc02), Some("copied on the Mac"));
+    // dc01's Windows copies: its text is for the Mac, and dc01 has it already.
+    bezel.on_engine(701, Event::Clipboard(Some("copied in dc01".into())));
+    assert_eq!(bezel.to_mac.as_deref(), Some("copied in dc01"));
+    assert_eq!(offered(&bezel, dc01), Some("copied in dc01"));
+    bezel.mac_copied(Some("copied in dc01".into()));
+    assert_eq!(offered(&bezel, dc02), Some("copied in dc01"), "pasted in dc02");
+    // Something other than text copied in dc02 leaves the Mac alone, and dc02 is offered the
+    // Mac's text again the next time it changes.
+    bezel.to_mac = None;
+    bezel.on_engine(702, Event::Clipboard(None));
+    assert_eq!(bezel.to_mac, None);
+    assert_eq!(offered(&bezel, dc02), None);
+    bezel.mac_copied(Some("copied in dc01".into()));
+    assert_eq!(offered(&bezel, dc02), Some("copied in dc01"));
+    // No text on the Mac (an image, say) is offered as nothing.
+    bezel.mac_copied(None);
+    assert_eq!((offered(&bezel, dc01), offered(&bezel, dc02)), (None, None));
+}
+
+#[test]
+fn a_session_that_ended_reconnects_as_it_signed_in_and_stays_muted() {
+    let Fixture { mut bezel, _alive, .. } = fixture();
+    let dc01 = live_tab(&mut bezel, "n_dc01", Some("c_admin"), 701);
+    bezel.toggle_mute(dc01);
+    bezel.on_engine(701, connected());
+    bezel.on_engine(701, Event::State(State::Reconnecting));
+    assert!(matches!(screen(&bezel, dc01), Screen::Live(l) if l.state == Phase::Reconnecting));
+    assert_eq!(bezel.session(dc01).unwrap().dot(), Some(Dot::Connecting), "amber");
+    bezel.on_engine(
+        701,
+        Event::State(State::Disconnected(Ended {
+            message: "The connection to dc01 was lost and did not come back".into(),
+            details: String::new(),
+            by_user: false,
+        })),
+    );
+    assert!(matches!(screen(&bezel, dc01), Screen::Ended(_)));
+    bezel.reconnect(dc01);
+    wait_until(&mut bezel, |b| matches!(screen(b, dc01), Screen::Live(_)));
+    assert!(bezel.session(dc01).unwrap().muted);
+    bezel.toggle_mute(dc01);
+    assert!(!bezel.session(dc01).unwrap().muted);
+    // A New host asks again: Bezel kept no password for it.
+    let host = bezel.open_host(Address::parse("10.0.0.5").unwrap(), Opening::Tab);
+    *screen_mut(&mut bezel, host) = Screen::Ended(Ended {
+        message: "10.0.0.5 ended the session".into(),
+        details: String::new(),
+        by_user: false,
+    });
+    bezel.reconnect(host);
+    assert!(matches!(screen(&bezel, host), Screen::SignIn(_)));
+}
+
+#[test]
+fn settings_changes_show_at_once_persist_and_reach_live_sessions() {
+    let Fixture { bezel, _alive, .. } = fixture();
+    let mut rt = Runtime::new(bezel, crate::view::view, (1024.0, 700.0), Env::new(false, 1.0));
+    rt.frame(0.0);
+    let dc01 = live_tab(&mut rt.state, "n_dc01", None, 701);
+    shortcut(&mut rt, command(','));
+    assert!(rt.find("settings-appearance").is_some(), "⌘, opens Settings");
+    rt.state.set_setting(Setting::Appearance(Appearance::Dark));
+    rt.state.set_setting(Setting::CommandKey(CommandKey::WindowsKey));
+    let Some(Sheet::Settings(sheet)) = &rt.state.sheet else {
+        panic!("the Settings sheet")
+    };
+    let shown = sheet.shown(snapshot(&rt.state).settings);
+    assert_eq!(
+        (shown.appearance, shown.command_key),
+        (Appearance::Dark, CommandKey::WindowsKey),
+        "both show while they save"
+    );
+    wait_until(&mut rt.state, |b| {
+        b.library.ready().unwrap().settings.command_key == CommandKey::WindowsKey
+    });
+    assert!(rt.state.dark(false));
+    assert!(
+        matches!(screen(&rt.state, dc01), Screen::Live(l) if l.keyboard.command_key() == CommandKey::WindowsKey),
+        "the live Session's ⌘ is the Windows key from now on"
+    );
+    let saved = Store_::open(library_file(&_alive), MemorySecrets::default())
+        .unwrap()
+        .snapshot()
+        .settings;
+    assert_eq!(
+        (saved.appearance, saved.command_key, saved.remember_certificates),
+        (Appearance::Dark, CommandKey::WindowsKey, false)
+    );
+    // A refused change goes back to what is on disk, and says so.
+    block_saves(&_alive);
+    rt.state.set_setting(Setting::RememberCertificates(true));
+    wait_until(
+        &mut rt.state,
+        |b| matches!(&b.sheet, Some(Sheet::Settings(sheet)) if sheet.error.is_some()),
+    );
+    let Some(Sheet::Settings(sheet)) = &rt.state.sheet else {
+        panic!("the Settings sheet")
+    };
+    assert!(!sheet.shown(snapshot(&rt.state).settings).remember_certificates);
+}
+
+#[test]
+fn command_comma_on_the_desktop_opens_settings_and_command_q_taps_no_windows_key() {
+    use rune::PhysicalKeyCode as K;
+    let Fixture { mut bezel, _alive, .. } = fixture();
+    let id = live_tab(&mut bezel, "n_dc01", None, 701);
+    let mut rt = Runtime::new(bezel, crate::view::view, (800.0, 600.0), Env::new(false, 1.0));
+    let command = Mods {
+        cmd: true,
+        logo: true,
+        ..Mods::default()
+    };
+    let mut taken = false;
+    rt.update(|s, tx| taken = s.physical(id, &physical(K::SuperLeft, Mods::default()), tx));
+    rt.update(|s, tx| taken &= s.physical(id, &physical(K::Comma, command), tx));
+    assert!(taken && matches!(rt.state.sheet, Some(Sheet::Settings(_))));
+    rt.state.close_sheet();
+    // ⌘ let go, then down again for ⌘Q, whose Q the app menu takes before the desktop.
+    let Screen::Live(live) = screen_mut(&mut rt.state, id) else {
+        panic!()
+    };
+    live.keyboard.key(Scancode::WINDOWS_LEFT, false);
+    live.keyboard.key(Scancode::WINDOWS_LEFT, true);
+    rt.update(|s, tx| {
+        crate::windows::on_quit_request(s, tx);
+    });
+    let Screen::Live(live) = screen_mut(&mut rt.state, id) else {
+        panic!()
+    };
+    assert_eq!(
+        live.keyboard.key(Scancode::WINDOWS_LEFT, false),
+        KeyOutcome::Send(Vec::new()),
+        "⌘'s key-up after the question is no lone Windows key tap"
+    );
+}
+
+#[test]
+fn keys_held_while_reconnecting_are_pressed_again_once_connected() {
+    let Fixture { mut bezel, _alive, .. } = fixture();
+    let id = live_tab(&mut bezel, "n_dc01", None, 701);
+    bezel.on_engine(701, connected());
+    hold_shift(&mut bezel, id);
+    bezel.on_engine(
+        701,
+        Event::State(State::Connected {
+            width: 1024,
+            height: 640,
+        }),
+    );
+    assert!(holds_keys(&mut bezel, id), "a new size keeps the keys held");
+    bezel.on_engine(701, Event::State(State::Reconnecting));
+    // Shift went down during the outage, when the engine sent nothing.
+    hold_shift(&mut bezel, id);
+    bezel.on_engine(701, connected());
+    assert!(
+        !holds_keys(&mut bezel, id),
+        "the keyboard starts over, so the next key presses Shift for the new connection"
+    );
+}
+
+#[test]
+fn open_data_folder_makes_the_folder_first_and_says_when_it_cannot() {
+    let Fixture { mut bezel, _alive, .. } = fixture();
+    let home = tempfile::tempdir().unwrap();
+    let folder = home.path().join("Application Support").join("Bezel");
+    bezel.open_folder(folder.clone());
+    wait_until(&mut bezel, |b| b.data_folder.is_some());
+    assert!(folder.is_dir(), "made before Finder is asked to show it");
+    bezel.data_folder = None;
+    // Under a file, no folder can be made.
+    let file = home.path().join("file");
+    std::fs::write(&file, "").unwrap();
+    bezel.open_settings();
+    bezel.open_folder(file.join("Bezel"));
+    wait_until(
+        &mut bezel,
+        |b| matches!(&b.sheet, Some(Sheet::Settings(s)) if s.error.is_some()),
+    );
+    assert!(bezel.data_folder.is_none());
 }

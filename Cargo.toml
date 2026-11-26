@@ -23,11 +23,16 @@ rune-image = { git = "https://github.com/anomalyco/rune", rev = "ee84b9c8e3e8eec
 rune-kit = { git = "https://github.com/anomalyco/rune", rev = "ee84b9c8e3e8eecd0613554d850d8a2f431d844b", default-features = false }
 rune-theme-opencode = { git = "https://github.com/anomalyco/rune", rev = "ee84b9c8e3e8eecd0613554d850d8a2f431d844b" }
 
-ironrdp-client = { git = "https://github.com/Devolutions/IronRDP", rev = "a0ad31cb864a25ec077034db2d4ced19575d5c20", features = ["rustls"] }
+ironrdp-client = { git = "https://github.com/Devolutions/IronRDP", rev = "a0ad31cb864a25ec077034db2d4ced19575d5c20", features = ["rustls", "clipboard"] }
+ironrdp-cliprdr = { git = "https://github.com/Devolutions/IronRDP", rev = "a0ad31cb864a25ec077034db2d4ced19575d5c20" }
 ironrdp-connector = { git = "https://github.com/Devolutions/IronRDP", rev = "a0ad31cb864a25ec077034db2d4ced19575d5c20" }
+ironrdp-core = { git = "https://github.com/Devolutions/IronRDP", rev = "a0ad31cb864a25ec077034db2d4ced19575d5c20" }
 ironrdp-displaycontrol = { git = "https://github.com/Devolutions/IronRDP", rev = "a0ad31cb864a25ec077034db2d4ced19575d5c20" }
 ironrdp-input = { git = "https://github.com/Devolutions/IronRDP", rev = "a0ad31cb864a25ec077034db2d4ced19575d5c20" }
 ironrdp-pdu = { git = "https://github.com/Devolutions/IronRDP", rev = "a0ad31cb864a25ec077034db2d4ced19575d5c20" }
+ironrdp-rdpsnd = { git = "https://github.com/Devolutions/IronRDP", rev = "a0ad31cb864a25ec077034db2d4ced19575d5c20" }
+# Without the Opus decoder, whose build needs CMake; the formats IronRDP decodes in Rust, PCM among them, remain.
+ironrdp-rdpsnd-native = { git = "https://github.com/Devolutions/IronRDP", rev = "a0ad31cb864a25ec077034db2d4ced19575d5c20", default-features = false }
 ironrdp-session = { git = "https://github.com/Devolutions/IronRDP", rev = "a0ad31cb864a25ec077034db2d4ced19575d5c20" }
 ironrdp-tls = { git = "https://github.com/Devolutions/IronRDP", rev = "a0ad31cb864a25ec077034db2d4ced19575d5c20", features = ["rustls"] }
 
