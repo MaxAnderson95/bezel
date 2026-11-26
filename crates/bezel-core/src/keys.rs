@@ -115,6 +115,10 @@ pub struct Keyboard {
     /// Keys whose press became a Bezel shortcut, so their release is swallowed too.
     swallowed: Vec<Scancode>,
     command: Option<CommandChord>,
+    /// Modifiers pressed because the platform reported them held, not because this keyboard
+    /// saw them go down (see `hold`). Each is the left key standing in for whichever side is
+    /// held, so it is released when the platform reports its modifier let go.
+    inferred: Vec<Scancode>,
 }
 
 #[derive(Debug, Default)]
@@ -145,11 +149,13 @@ impl Keyboard {
         }
     }
 
-    /// Catches up with modifiers held down before this keyboard saw them, such as ⌘ still held
-    /// from the ⌘2 that switched to this Session's Tab, so the next key makes the chord the
-    /// person is holding. `key` is the event's own key, whose modifier the event itself presses
-    /// or releases. Returns what to send for the presses; a release this keyboard missed is
-    /// left to the release of everything when the Session loses the keyboard.
+    /// Brings the keyboard up to the modifiers the platform reports held as the event for `key`
+    /// arrives, and returns what that sends. A modifier held down before this keyboard saw it,
+    /// such as ⌘ still held from the ⌘2 that switched to this Session's Tab, is pressed (as its
+    /// left key) so the next key makes the chord the person is holding; the event's own
+    /// modifier is left to the event. A modifier pressed that way is released as soon as the
+    /// platform reports it let go, whichever side's key-up says so, and an inferred ⌘ never
+    /// becomes a lone Windows key tap: it was held for something else.
     pub fn hold(&mut self, held: Held, key: Scancode) -> Vec<KeyOp> {
         let wanted = [
             (Modifier::Shift, held.shift, Scancode::SHIFT_LEFT),
@@ -158,13 +164,26 @@ impl Keyboard {
             (Modifier::Command, held.command, Scancode::WINDOWS_LEFT),
         ];
         let mut ops = Vec::new();
-        for (m, down, press) in wanted {
-            if down
-                && modifier(key) != Some(m)
-                && !self.is_held(m)
-                && let KeyOutcome::Send(sent) = self.press(press)
-            {
-                ops.extend(sent);
+        for (m, down, stand_in) in wanted {
+            if !down {
+                let gone: Vec<Scancode> = self
+                    .inferred
+                    .iter()
+                    .copied()
+                    .filter(|k| modifier(*k) == Some(m))
+                    .collect();
+                self.inferred.retain(|k| modifier(*k) != Some(m));
+                for k in gone {
+                    ops.extend(self.release(k));
+                }
+            } else if modifier(key) != Some(m) && !self.is_held(m) {
+                if let KeyOutcome::Send(sent) = self.press(stand_in) {
+                    ops.extend(sent);
+                }
+                self.inferred.push(stand_in);
+                if let Some(chord) = self.command.as_mut().filter(|_| m == Modifier::Command) {
+                    chord.used = true;
+                }
             }
         }
         ops
@@ -177,6 +196,8 @@ impl Keyboard {
             return KeyOutcome::Send(vec![KeyOp::Press(key), KeyOp::Release(key)]);
         }
         if pressed {
+            // Seen going down now, the key is the person's own and is released by its key-up.
+            self.inferred.retain(|k| *k != key);
             self.press(key)
         } else {
             KeyOutcome::Send(self.release(key))
@@ -198,6 +219,7 @@ impl Keyboard {
             ops.push(KeyOp::Release(Scancode::CONTROL_LEFT));
         }
         self.swallowed.clear();
+        self.inferred.clear();
         ops
     }
 
@@ -254,6 +276,7 @@ impl Keyboard {
             return Vec::new();
         };
         self.held.remove(at);
+        self.inferred.retain(|k| *k != key);
         if let Some(at) = self.swallowed.iter().position(|k| *k == key) {
             self.swallowed.remove(at);
             return Vec::new();
@@ -363,6 +386,158 @@ mod tests {
         let mut k = Keyboard::new(CommandKey::WindowsKey);
         assert!(k.hold(command, WIN).is_empty());
         assert_eq!(k.key(WIN, true), send(&[Press(WIN)]));
+    }
+
+    /// The keys a Session's Windows sees down, from the ops sent to it.
+    #[derive(Debug, Default)]
+    struct Remote(Vec<Scancode>);
+
+    impl Remote {
+        fn apply(&mut self, ops: &[KeyOp]) {
+            for op in ops {
+                match *op {
+                    Press(k) => {
+                        if !self.0.contains(&k) {
+                            self.0.push(k)
+                        }
+                    }
+                    Release(k) => self.0.retain(|held| *held != k),
+                }
+            }
+        }
+
+        fn shifted(&self) -> bool {
+            self.0.contains(&Scancode::SHIFT_LEFT) || self.0.contains(&Scancode::SHIFT_RIGHT)
+        }
+    }
+
+    /// One key event as `keymap::translate` feeds it: the held modifiers first, then the key.
+    /// Returns what was sent.
+    fn event(k: &mut Keyboard, remote: &mut Remote, key: Scancode, pressed: bool, held: Held) -> Vec<KeyOp> {
+        let mut ops = k.hold(held, key);
+        match k.key(key, pressed) {
+            KeyOutcome::Send(sent) => ops.extend(sent),
+            KeyOutcome::Shortcut(s) => panic!("{key:?} became {s:?}"),
+        }
+        remote.apply(&ops);
+        ops
+    }
+
+    fn held(shift: bool, command: bool) -> Held {
+        Held {
+            shift,
+            command,
+            ..Held::default()
+        }
+    }
+
+    /// ⇧ and ⌘ held down before this keyboard saw them (the ⇧⌘] that switched Tabs), then let go
+    /// in either order, with or without a key typed while both were down, for each side of each
+    /// and each ⌘ setting: no Windows key tap, nothing left down in Windows, and the next key
+    /// typed plain.
+    #[test]
+    fn inherited_modifiers_are_let_go_whichever_side_and_order() {
+        const SHIFTS: [Scancode; 2] = [Scancode::SHIFT_LEFT, Scancode::SHIFT_RIGHT];
+        const COMMANDS: [Scancode; 2] = [Scancode::WINDOWS_LEFT, Scancode::WINDOWS_RIGHT];
+        for setting in [CommandKey::MacShortcuts, CommandKey::WindowsKey] {
+            for shift in SHIFTS {
+                for command in COMMANDS {
+                    for shift_first in [true, false] {
+                        for typed in [false, true] {
+                            let case =
+                                format!("{setting:?} {shift:?} {command:?} shift_first={shift_first} typed={typed}");
+                            let mut k = Keyboard::new(setting);
+                            let mut remote = Remote::default();
+                            let mut sent = Vec::new();
+                            if typed {
+                                sent.extend(event(&mut k, &mut remote, A, true, held(true, true)));
+                                sent.extend(event(&mut k, &mut remote, A, false, held(true, true)));
+                            }
+                            let (first, then, after_first) = match shift_first {
+                                true => (shift, command, held(false, true)),
+                                false => (command, shift, held(true, false)),
+                            };
+                            sent.extend(event(&mut k, &mut remote, first, false, after_first));
+                            sent.extend(event(&mut k, &mut remote, then, false, held(false, false)));
+                            if setting == CommandKey::MacShortcuts {
+                                assert!(!sent.contains(&Press(WIN)), "{case}: a lone Windows key tap");
+                            }
+                            assert_eq!(remote.0, vec![], "{case}: left down in Windows");
+                            assert_eq!(
+                                event(&mut k, &mut remote, C, true, held(false, false)),
+                                vec![Press(C)],
+                                "{case}: the next key is plain"
+                            );
+                            assert_eq!(k.release_all(), vec![Release(C)], "{case}");
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn an_inherited_right_shift_lets_go_when_released() {
+        let mut k = Keyboard::new(CommandKey::MacShortcuts);
+        let mut remote = Remote::default();
+        event(&mut k, &mut remote, A, true, held(true, false));
+        assert!(remote.shifted(), "A is typed shifted");
+        event(&mut k, &mut remote, A, false, held(true, false));
+        event(&mut k, &mut remote, Scancode::SHIFT_RIGHT, false, held(false, false));
+        event(&mut k, &mut remote, C, true, held(false, false));
+        assert!(!remote.shifted(), "C is typed plain");
+    }
+
+    #[test]
+    fn a_shift_held_on_both_sides_stays_down_until_both_are_let_go() {
+        let mut k = Keyboard::new(CommandKey::MacShortcuts);
+        let mut remote = Remote::default();
+        // Right ⇧ held from before; left ⇧ pressed here, then let go while right is still down.
+        event(&mut k, &mut remote, A, true, held(true, false));
+        event(&mut k, &mut remote, A, false, held(true, false));
+        event(&mut k, &mut remote, Scancode::SHIFT_LEFT, true, held(true, false));
+        event(&mut k, &mut remote, Scancode::SHIFT_LEFT, false, held(true, false));
+        event(&mut k, &mut remote, C, true, held(true, false));
+        assert!(remote.shifted(), "right ⇧ is still down");
+        event(&mut k, &mut remote, C, false, held(true, false));
+        event(&mut k, &mut remote, Scancode::SHIFT_RIGHT, false, held(false, false));
+        assert_eq!(remote.0, vec![]);
+        // Both seen going down here: each key-up is its own.
+        event(&mut k, &mut remote, Scancode::SHIFT_LEFT, true, held(true, false));
+        event(&mut k, &mut remote, Scancode::SHIFT_RIGHT, true, held(true, false));
+        event(&mut k, &mut remote, Scancode::SHIFT_LEFT, false, held(true, false));
+        assert!(remote.shifted());
+        event(&mut k, &mut remote, Scancode::SHIFT_RIGHT, false, held(false, false));
+        assert_eq!(remote.0, vec![]);
+    }
+
+    #[test]
+    fn an_inherited_command_never_taps_the_windows_key_but_one_pressed_here_does() {
+        let mut k = Keyboard::new(CommandKey::MacShortcuts);
+        let mut remote = Remote::default();
+        // ⌘ held from before, let go with nothing typed.
+        let mut sent = event(&mut k, &mut remote, Scancode::SHIFT_LEFT, true, held(true, true));
+        sent.extend(event(
+            &mut k,
+            &mut remote,
+            Scancode::SHIFT_LEFT,
+            false,
+            held(false, true),
+        ));
+        sent.extend(event(
+            &mut k,
+            &mut remote,
+            Scancode::WINDOWS_RIGHT,
+            false,
+            held(false, false),
+        ));
+        assert!(!sent.contains(&Press(WIN)));
+        // ⌘ pressed and released here alone is still the Windows key.
+        let sent: Vec<KeyOp> = [true, false]
+            .into_iter()
+            .flat_map(|down| event(&mut k, &mut remote, WIN, down, held(false, down)))
+            .collect();
+        assert_eq!(sent, vec![Press(WIN), Release(WIN)]);
     }
 
     fn send(ops: &[KeyOp]) -> KeyOutcome {
