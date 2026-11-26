@@ -179,6 +179,9 @@ impl Bezel {
 
     /// Keys in the palette's field: arrows move the selection, Return and its modifiers choose.
     pub fn palette_key(&mut self, event: &KeyEvent) -> bool {
+        if !self.palette_shows_rows() {
+            return false;
+        }
         let count = self.palette_rows().len();
         let palette = &mut self.here.palette;
         match event.key {
@@ -188,6 +191,12 @@ impl Bezel {
             _ => return false,
         }
         true
+    }
+
+    /// The floating palette always lists its matches; the inline field only once something is
+    /// typed, and until then has nothing to choose.
+    fn palette_shows_rows(&self) -> bool {
+        self.here.palette.open || !self.here.palette.query.text.trim().is_empty()
     }
 
     pub fn palette_edited(&mut self) {
@@ -217,8 +226,9 @@ impl Bezel {
             (Item::Saved(id), How::Return) => self.open(&id, Opening::Tab, false),
             (Item::Saved(id), How::Command) => self.open(&id, Opening::Window, false),
             (Item::Saved(id), How::Option) | (Item::Edit(id), _) => {
-                self.show_main();
-                self.edit_connection(&id);
+                if self.ready_to_manage() {
+                    self.edit_connection(&id);
+                }
             }
             (Item::NewHost(typed), how) => {
                 let Ok(address) = Address::parse(&typed) else { return };
@@ -230,22 +240,24 @@ impl Bezel {
                     How::Command => {
                         self.open_host(address, Opening::Window);
                     }
-                    How::Option => {
-                        self.show_main();
+                    How::Option if self.ready_to_manage() => {
                         self.new_connection(None);
                         if let Some(Sheet::Connection(form)) = &mut self.sheet {
                             form.host = TextEdit::new(typed);
                         }
                     }
+                    How::Option => {}
                 }
             }
             (Item::Credentials, _) => {
-                self.show_main();
-                self.open_credentials(None);
+                if self.ready_to_manage() {
+                    self.open_credentials(None);
+                }
             }
             (Item::Certificates, _) => {
-                self.show_main();
-                self.open_certificates();
+                if self.ready_to_manage() {
+                    self.open_certificates();
+                }
             }
         }
     }

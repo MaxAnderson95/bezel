@@ -154,6 +154,14 @@ fn focused(text: impl Into<String>) -> TextEdit {
 }
 
 impl Bezel {
+    /// Brings the Main window forward for a Library action asked for from any window. False when
+    /// a sheet or confirmation is already open there: it stays as it is, draft and pending save
+    /// included, for the person to finish or close first.
+    pub(crate) fn ready_to_manage(&mut self) -> bool {
+        self.show_main();
+        self.sheet.is_none() && self.deleting.is_none()
+    }
+
     pub fn close_sheet(&mut self) {
         self.sheet = None;
     }
@@ -181,7 +189,9 @@ impl Bezel {
         else {
             return;
         };
-        self.show_main();
+        if !self.ready_to_manage() {
+            return;
+        }
         self.new_connection(None);
         if let Some(Sheet::Connection(form)) = &mut self.sheet {
             form.host = focused(address_text(&address));

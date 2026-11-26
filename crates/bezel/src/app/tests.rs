@@ -1,7 +1,7 @@
 use std::sync::Arc;
 use std::time::Duration;
 
-use bezel_core::keys::Keyboard;
+use bezel_core::keys::{Keyboard, Scancode};
 use bezel_core::library::{Group, GroupId, Library as Store_};
 use bezel_core::secrets::MemorySecrets;
 use rune::{Env, Mods, Runtime};
@@ -131,6 +131,7 @@ fn live_tab(bezel: &mut Bezel, connection: &str, credential: Option<&str>, engin
         credential: snapshot(bezel).credential(&id.into()).unwrap().clone(),
         adding: None,
         assign: false,
+        assigning: None,
     });
     let id = bezel.next_id();
     let mut session = fixture_session(id, Destination::connection(&found), Phase::Connecting, None);
@@ -980,4 +981,173 @@ fn a_session_window_draws_its_session_with_its_own_title_bar() {
     press(&mut rt, "move-to-main");
     assert!(rt.state.session(dc01).unwrap().place.is_tab());
     assert_eq!(rt.state.active, Some(dc01));
+}
+
+/// Holds Shift in the Session's keyboard, as a desktop that saw Shift go down would.
+fn hold_shift(bezel: &mut Bezel, id: SessionId) {
+    let Screen::Live(live) = screen_mut(bezel, id) else {
+        panic!()
+    };
+    live.keyboard.key(Scancode::SHIFT_LEFT, true);
+}
+
+fn holds_keys(bezel: &mut Bezel, id: SessionId) -> bool {
+    let Screen::Live(live) = screen_mut(bezel, id) else {
+        panic!()
+    };
+    !live.keyboard.release_all().is_empty()
+}
+
+#[test]
+fn switching_tabs_lets_go_of_the_keys_the_old_tab_held() {
+    let Fixture { mut bezel, _alive, .. } = fixture();
+    let a = live_tab(&mut bezel, "n_dc01", None, 701);
+    let b = live_tab(&mut bezel, "n_dc02", None, 702);
+    hold_shift(&mut bezel, b);
+    bezel.reveal(a);
+    assert!(
+        !holds_keys(&mut bezel, b),
+        "dc02's desktop left the tree with Shift down"
+    );
+    hold_shift(&mut bezel, a);
+    bezel.step_tab(1);
+    assert!(!holds_keys(&mut bezel, a));
+    hold_shift(&mut bezel, b);
+    bezel.reveal(b);
+    assert!(holds_keys(&mut bezel, b), "staying on the Tab keeps its keys");
+}
+
+#[test]
+fn a_rejected_one_off_sign_in_asks_again_for_its_own_account() {
+    let Fixture { mut bezel, _alive, .. } = fixture();
+    let alice = live_tab(&mut bezel, "n_dc01", None, 701);
+    if let Screen::Live(live) = screen_mut(&mut bezel, alice) {
+        live.username = r"CORP\alice".into();
+    }
+    // Bob signed in somewhere else since.
+    bezel.last_username = r"CORP\bob".into();
+    bezel.on_engine(701, rejected());
+    let Screen::SignIn(sign_in) = screen(&bezel, alice) else {
+        panic!()
+    };
+    assert_eq!(sign_in.username.text, r"CORP\alice");
+}
+
+#[test]
+fn a_wrong_password_prompt_for_a_credential_deleted_meanwhile_is_the_sign_in_sheet() {
+    let Fixture { mut bezel, _alive, .. } = fixture();
+    let id = live_tab(&mut bezel, "n_dc01", Some("c_admin"), 700);
+    bezel.apply(Change::DeleteCredential("c_admin".into()));
+    wait_until(&mut bezel, |b| snapshot(b).credentials.is_empty());
+    bezel.on_engine(700, rejected());
+    let Screen::SignIn(sign_in) = screen(&bezel, id) else {
+        panic!("no prompt for a Credential that is gone")
+    };
+    assert_eq!(sign_in.error.as_deref(), Some(DELETED));
+    assert_eq!(sign_in.username.text, r"CORP\admin.max");
+}
+
+#[test]
+fn opening_a_connection_prefers_its_open_session_over_one_that_ended() {
+    let Fixture { mut bezel, _alive, .. } = fixture();
+    let first = live_tab(&mut bezel, "n_dc01", None, 701);
+    let second = live_tab(&mut bezel, "n_dc01", None, 702);
+    bezel.on_engine(
+        701,
+        Event::State(State::Disconnected(Ended {
+            message: "dc01 dropped".into(),
+            details: String::new(),
+            by_user: false,
+        })),
+    );
+    bezel.reveal(first);
+    bezel.open(&"n_dc01".into(), Opening::Tab, false);
+    assert_eq!(bezel.active, Some(second));
+    assert!(matches!(screen(&bezel, first), Screen::Ended(_)));
+    assert_eq!(engine(&bezel, second), 702);
+    // With only the ended one left, opening it in a window signs in again there.
+    bezel.close(second);
+    bezel.open(&"n_dc01".into(), Opening::Window, false);
+    assert!(!bezel.session(first).unwrap().place.is_tab());
+    assert!(!matches!(screen(&bezel, first), Screen::Ended(_)));
+}
+
+#[test]
+fn a_session_window_forgets_its_size_when_it_goes() {
+    let Fixture { mut bezel, _alive, .. } = fixture();
+    let id = live_tab(&mut bezel, "n_dc01", None, 701);
+    bezel.move_to_window(id, None);
+    let view = View {
+        width: 800.0,
+        height: 600.0,
+        scale: 2.0,
+    };
+    bezel.areas.push((crate::windows::Window::Session(id), view));
+    bezel.move_to_main(id);
+    bezel.move_to_window(id, None);
+    assert_eq!(bezel.area_of(crate::windows::Window::Session(id)), None);
+}
+
+#[test]
+fn the_empty_connect_box_chooses_nothing_it_does_not_show() {
+    let Fixture { mut bezel, _alive, .. } = fixture();
+    let enter = KeyEvent {
+        key: Key::Enter,
+        mods: Mods::default(),
+    };
+    assert!(!bezel.palette_key(&enter));
+    assert!(bezel.sessions.is_empty());
+    bezel.here.palette.query = TextEdit::new("dc01");
+    assert!(bezel.palette_key(&enter));
+    assert_eq!(bezel.sessions.len(), 1);
+}
+
+#[test]
+fn managing_from_another_window_keeps_the_form_already_open() {
+    let Fixture { mut bezel, _alive, .. } = fixture();
+    bezel.edit_connection(&"n_dc01".into());
+    if let Some(Sheet::Connection(form)) = &mut bezel.sheet {
+        form.name = TextEdit::new("draft");
+    }
+    let id = live_tab(&mut bezel, "n_dc02", None, 702);
+    bezel.move_to_window(id, None);
+    bezel.here.window = crate::windows::Window::Session(id);
+    for (query, item) in [
+        ("dc02", crate::palette::Item::Edit("n_dc02".into())),
+        ("cred", crate::palette::Item::Credentials),
+    ] {
+        bezel.here.palette.open = true;
+        bezel.here.palette.query = TextEdit::new(query);
+        let rows = crate::palette::rows(query, &bezel.sessions, bezel.library.ready());
+        let index = rows.iter().position(|r| r.item == item).expect("the row");
+        bezel.choose(index, crate::palette::How::Return);
+    }
+    let Some(Sheet::Connection(form)) = &bezel.sheet else {
+        panic!("the draft's sheet is still open")
+    };
+    assert_eq!(form.name.text, "draft");
+    assert_eq!(form.editing.as_ref().map(|c| c.id.as_str()), Some("n_dc01"));
+}
+
+#[test]
+fn a_refused_credential_assignment_is_reported_on_its_session() {
+    let Fixture { mut bezel, _alive, .. } = fixture();
+    let (id, _) = sign_in_saving(&mut bezel, "typed");
+    wait_until(&mut bezel, |b| snapshot(b).credentials.len() == 2);
+    block_saves(&_alive);
+    bezel.on_engine(engine(&bezel, id), connected());
+    wait_until(&mut bezel, |b| b.session(id).unwrap().notice.is_some());
+    assert!(bezel.notice.is_none(), "not the Main window's notice");
+}
+
+#[test]
+fn a_quit_question_closes_the_palette_over_it() {
+    let Fixture { mut bezel, _alive, .. } = fixture();
+    live_tab(&mut bezel, "n_dc01", None, 701);
+    bezel.here.palette.open = true;
+    let mut rt = Runtime::new(bezel, crate::view::view, (800.0, 600.0), Env::new(false, 1.0));
+    rt.update(|s, tx| {
+        let _ = crate::windows::on_quit_request(s, tx);
+    });
+    assert!(rt.state.quitting && !rt.state.here.palette.open);
 }

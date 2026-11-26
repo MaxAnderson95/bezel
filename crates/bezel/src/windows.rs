@@ -178,6 +178,8 @@ impl Bezel {
     /// Opens a Session window for the Session, at `at` (the frame's top-left in desktop pixels)
     /// or where the system puts it.
     pub(crate) fn open_window(&mut self, id: SessionId, at: Option<(i32, i32)>) {
+        // A size from an earlier window of this Session would let the new one skip resizing it.
+        self.areas.retain(|(w, _)| *w != Window::Session(id));
         self.next_window += 1;
         let key = format!("session-{}", self.next_window);
         let size = self
@@ -243,8 +245,8 @@ impl Bezel {
         }
     }
 
-    /// Lets go of every key the Session holds: the window it leaves won't send their releases.
-    fn release_keys(&mut self, id: SessionId) {
+    /// Lets go of every key the Session holds: the desktop it leaves won't send their releases.
+    pub(crate) fn release_keys(&mut self, id: SessionId) {
         if let Some(Screen::Live(live)) = self.session_mut(id).map(|s| &mut s.screen) {
             live.release_keys();
             live.handle.input(Input::ReleaseAll);
@@ -369,6 +371,7 @@ pub fn on_main_close_request(s: &mut Bezel, _: &mut Tx) -> CloseResponse {
 fn on_window_closed(s: &mut Bezel, _: &mut Tx) {
     s.alarm.remove(&s.here.key);
     let Window::Session(id) = s.here.window else { return };
+    s.areas.retain(|(w, _)| *w != Window::Session(id));
     let mine = matches!(s.session(id).map(|x| &x.place), Some(Place::Window(w)) if w.key() == s.here.key);
     if mine {
         s.end(id);
@@ -392,6 +395,8 @@ pub fn on_quit_request(s: &mut Bezel, _: &mut Tx) -> QuitResponse {
         return QuitResponse::Quit;
     }
     s.quitting = true;
+    // The question takes the keyboard, not a palette left open in this window.
+    s.close_palette();
     if let Some(main) = &s.main {
         main.open();
     }

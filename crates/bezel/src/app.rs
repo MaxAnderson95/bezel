@@ -288,6 +288,8 @@ struct Signing {
     /// Assign the Credential to the Connection once signed in: it was saved from the sign-in
     /// sheet of a Connection that asks each time, so it stops asking.
     assign: bool,
+    /// The save making the Credential the Connection's, in flight.
+    assigning: Option<RequestId>,
 }
 
 /// A Session's status dot, in its Tab and the sidebar.
@@ -325,7 +327,11 @@ impl Session {
     fn awaits(&self, id: RequestId) -> bool {
         match &self.screen {
             Screen::Live(live) => {
-                live.trust == Trust::Remembering(id) || live.signing.as_ref().is_some_and(|s| s.adding == Some(id))
+                live.trust == Trust::Remembering(id)
+                    || live
+                        .signing
+                        .as_ref()
+                        .is_some_and(|s| s.adding == Some(id) || s.assigning == Some(id))
             }
             Screen::Retry(retry) => {
                 retry.adding == Some(id) || retry.saving.as_ref().is_some_and(|(saving, ..)| *saving == id)
@@ -529,6 +535,16 @@ impl Bezel {
             }
             Screen::Live(live) => {
                 let Some(signing) = &mut live.signing else { return };
+                if signing.assigning == Some(id) {
+                    signing.assigning = None;
+                    if let Some(e) = error {
+                        s.notice = Some(format!(
+                            "Signed in, but {} was not saved as this connection's credential, so it will ask again. {e}",
+                            signing.credential.name
+                        ));
+                    }
+                    return;
+                }
                 signing.adding = None;
                 match error {
                     None => self.assign_when_signed_in(session),
@@ -632,7 +648,12 @@ impl Bezel {
                 }
                 retry.credential = now.clone();
             }
-            None if !retry.saving() => self.ask(session, Some(DELETED.into())),
+            None if !retry.saving() => {
+                let username = retry.credential.username.clone();
+                if let Some(screen) = self.screen_mut(session) {
+                    *screen = Screen::SignIn(SignIn::new(username, Some(DELETED.into())));
+                }
+            }
             None => {}
         }
     }
@@ -679,25 +700,34 @@ impl Bezel {
             return;
         };
         let to = Destination::connection(found);
-        let existing = (!another)
-            .then(|| {
-                self.sessions
-                    .iter()
-                    .find(|s| s.to.connection.as_ref() == Some(connection))
-            })
-            .flatten()
-            .map(|s| (s.id, matches!(s.screen, Screen::Ended(_)), s.place.is_tab()));
-        let id = match existing {
-            // A Session that ended is opened again where it is.
-            Some((id, true, _)) => {
+        let mine = |ended: bool| {
+            self.sessions
+                .iter()
+                .filter(|s| s.to.connection.as_ref() == Some(connection))
+                .find(|s| matches!(s.screen, Screen::Ended(_)) == ended)
+                .map(|s| (s.id, s.place.is_tab()))
+        };
+        // A Session still open wins over one that ended.
+        let (open, ended) = match another {
+            true => (None, None),
+            false => (mine(false), mine(true)),
+        };
+        let id = match (open, ended) {
+            (Some((id, true)), _) if opening == Opening::Window => return self.move_to_window(id, None),
+            (Some((id, _)), _) => return self.reveal(id),
+            // A Session that ended is opened again, where it was asked for.
+            (None, Some((id, tab))) => {
+                match (opening, tab) {
+                    (Opening::Window, true) => self.move_to_window(id, None),
+                    (Opening::Tab, false) => self.move_to_main(id),
+                    (Opening::Tab, true) | (Opening::Window, false) => {}
+                }
                 if let Some(session) = self.session_mut(id) {
                     session.to = to;
                 }
                 id
             }
-            Some((id, false, true)) if opening == Opening::Window => return self.move_to_window(id, None),
-            Some((id, false, _)) => return self.reveal(id),
-            None => self.add(to, opening),
+            (None, None) => self.add(to, opening),
         };
         self.start(id);
         self.reveal(id);
@@ -750,6 +780,10 @@ impl Bezel {
 
     /// Makes the Tab the Main window's current one, sized to the Main window's area.
     pub fn activate(&mut self, id: SessionId) {
+        // The outgoing Tab's desktop leaves the tree, so its key releases never arrive.
+        if let Some(old) = self.active.filter(|old| *old != id) {
+            self.release_keys(old);
+        }
         self.active = Some(id);
         self.resize(id, self.area_of(Window::Main));
     }
@@ -825,6 +859,7 @@ impl Bezel {
                         credential,
                         adding: None,
                         assign,
+                        assigning: None,
                     }),
                 },
             ),
@@ -853,7 +888,13 @@ impl Bezel {
             host: session.to.address.host.clone(),
             port: session.to.address.port,
         };
-        self.apply(change);
+        let request = self.apply(change);
+        if let Some(Screen::Live(Live {
+            signing: Some(signing), ..
+        })) = self.screen_mut(id)
+        {
+            signing.assigning = request;
+        }
     }
 
     /// Cancel on the sign-in sheet or the wrong-password prompt: the Session never connected,
@@ -922,6 +963,7 @@ impl Bezel {
                 credential,
                 adding: Some(adding),
                 assign,
+                assigning: None,
             })
         } else {
             None
@@ -1009,7 +1051,6 @@ impl Bezel {
 
     fn on_session(&mut self, id: SessionId, event: Event) {
         let remember = self.library.ready().is_some_and(|s| s.settings.remember_certificates);
-        let username = self.last_username.clone();
         let Some(session) = self.session_mut(id) else { return };
         let Screen::Live(live) = &mut session.screen else {
             return;
@@ -1044,8 +1085,11 @@ impl Bezel {
                         Screen::Retry(retry)
                     }
                     Some(_) => Screen::Ended(ended),
-                    None => Screen::SignIn(SignIn::new(username, Some(ended.message))),
+                    // The account this Session typed, not whichever was typed last anywhere.
+                    None => Screen::SignIn(SignIn::new(live.username.clone(), Some(ended.message))),
                 };
+                // The Credential may have changed or gone while this Session signed in.
+                self.follow_retry(id);
             }
         }
     }
@@ -1160,6 +1204,12 @@ impl Bezel {
         }
     }
 
+    /// ⌃⌘F. The tab row starts hidden in full screen until the pointer reaches the top edge.
+    pub fn toggle_full_screen(&mut self, tx: &mut Tx) {
+        self.here.reveal = false;
+        tx.toggle_full_screen();
+    }
+
     pub fn toggle_sidebar(&mut self) {
         self.sidebar = !self.sidebar;
     }
@@ -1221,7 +1271,7 @@ impl Bezel {
                 None => return false,
             },
             Shortcut::Sidebar => self.toggle_sidebar(),
-            Shortcut::FullScreen => tx.toggle_full_screen(),
+            Shortcut::FullScreen => self.toggle_full_screen(tx),
             Shortcut::PreviousTab => self.step_tab(-1),
             Shortcut::NextTab => self.step_tab(1),
             Shortcut::Tab(n) => self.nth_tab(usize::from(n)),

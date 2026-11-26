@@ -50,8 +50,9 @@ fn main_window(s: &Bezel, cx: &mut Cx<Bezel>) -> El {
         );
     }
     sheets::confirm(s, k, &mut layer);
-    quit_dialog(s, k, &mut layer);
     palette::floating(s, k, &mut layer);
+    // Last, so the question is the top modal over any palette or sheet.
+    quit_dialog(s, k, &mut layer);
     let area = col()
         .key("area")
         .w_full()

@@ -169,7 +169,7 @@ fn main_actions(session: &Session, k: &Kit) -> El {
         .child(
             icon_button(&icons::OUTLINE_MAXIMIZE, "Full screen")
                 .shortcut("⌃⌘F")
-                .on_press_tx(|_: &mut Bezel, tx: &mut Tx| tx.toggle_full_screen())
+                .on_press_tx(Bezel::toggle_full_screen)
                 .build(k)
                 .key("full-screen"),
         )
