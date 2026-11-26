@@ -37,7 +37,7 @@ fn connection(form: &ConnectionForm, snapshot: &Snapshot, k: &Kit, layer: &mut V
     fn edit(s: &mut Bezel, field: fn(&mut ConnectionForm) -> &mut TextEdit) -> &mut TextEdit {
         match &mut s.sheet {
             Some(Sheet::Connection(form)) => field(form),
-            _ => &mut s.host,
+            _ => &mut s.scratch,
         }
     }
     let default = match bezel_core::address::Address::parse(&form.host.text) {
@@ -145,7 +145,7 @@ fn group(form: &GroupForm, k: &Kit, layer: &mut Vec<El>) {
         .width(None)
         .on_edit(|s: &mut Bezel| match &mut s.sheet {
             Some(Sheet::Group(form)) => &mut form.name,
-            _ => &mut s.host,
+            _ => &mut s.scratch,
         })
         .on_submit(|s: &mut Bezel, _: &mut Tx| s.save_group())
         .build(k)
@@ -192,7 +192,7 @@ fn credentials(sheet: &Credentials, snapshot: &Snapshot, k: &Kit, layer: &mut Ve
         .width(None)
         .on_edit(|s: &mut Bezel| match &mut s.sheet {
             Some(Sheet::Credentials(sheet)) => &mut sheet.search,
-            _ => &mut s.host,
+            _ => &mut s.scratch,
         })
         .build(k)
         .key("credentials-search");
@@ -330,7 +330,7 @@ fn credential_detail(sheet: &Credentials, saved: Option<&Credential>, snapshot: 
             .width(None)
             .on_edit(move |s: &mut Bezel| match &mut s.sheet {
                 Some(Sheet::Credentials(sheet)) => field(sheet),
-                _ => &mut s.host,
+                _ => &mut s.scratch,
             })
             .on_submit(|s: &mut Bezel, _: &mut Tx| s.save_credential())
     };

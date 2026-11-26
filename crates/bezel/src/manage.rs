@@ -9,7 +9,7 @@ use bezel_core::secrets::Secret;
 use bezel_core::trust::Fingerprint;
 use rune::{Drag, Phase, TextEdit, Tx};
 
-use crate::app::{Bezel, today};
+use crate::app::{Bezel, Destination, SessionId, today};
 use crate::store::RequestId;
 
 pub enum Sheet {
@@ -28,6 +28,17 @@ pub struct ConnectionForm {
     pub group: Option<GroupId>,
     pub error: Option<String>,
     saving: Option<RequestId>,
+    /// The New host Session this Connection is saved from.
+    session: Option<Adopt>,
+}
+
+/// A New host Session waiting for the Connection saved from it.
+struct Adopt {
+    session: SessionId,
+    /// The Session's address when the sheet opened.
+    address: Address,
+    /// The Connection being saved, once Save is pressed.
+    connection: Option<ConnectionId>,
 }
 
 impl ConnectionForm {
@@ -107,10 +118,14 @@ pub fn default_name(host: &str) -> String {
 
 /// A Connection's address as its Host field shows it: the port only when it isn't 3389.
 pub fn host_text(connection: &Connection) -> String {
-    match (connection.port, connection.host.contains(':')) {
-        (bezel_core::address::DEFAULT_PORT, _) => connection.host.clone(),
-        (port, true) => format!("[{}]:{port}", connection.host),
-        (port, false) => format!("{}:{port}", connection.host),
+    address_text(&connection.address())
+}
+
+pub fn address_text(address: &Address) -> String {
+    match (address.port, address.host.contains(':')) {
+        (bezel_core::address::DEFAULT_PORT, _) => address.host.clone(),
+        (port, true) => format!("[{}]:{port}", address.host),
+        (port, false) => format!("{}:{port}", address.host),
     }
 }
 
@@ -139,6 +154,14 @@ fn focused(text: impl Into<String>) -> TextEdit {
 }
 
 impl Bezel {
+    /// Brings the Main window forward for a Library action asked for from any window. False when
+    /// a sheet or confirmation is already open there: it stays as it is, draft and pending save
+    /// included, for the person to finish or close first.
+    pub(crate) fn ready_to_manage(&mut self) -> bool {
+        self.show_main();
+        self.sheet.is_none() && self.deleting.is_none()
+    }
+
     pub fn close_sheet(&mut self) {
         self.sheet = None;
     }
@@ -152,7 +175,32 @@ impl Bezel {
             group,
             error: None,
             saving: None,
+            session: None,
         }));
+    }
+
+    /// "Save as connection" for a New host: the New connection sheet with its address, and
+    /// once saved, the Session is that Connection's.
+    pub fn save_as_connection(&mut self, session: SessionId) {
+        let Some(address) = self
+            .session(session)
+            .filter(|s| s.to.connection.is_none())
+            .map(|s| s.to.address.clone())
+        else {
+            return;
+        };
+        if !self.ready_to_manage() {
+            return;
+        }
+        self.new_connection(None);
+        if let Some(Sheet::Connection(form)) = &mut self.sheet {
+            form.host = focused(address_text(&address));
+            form.session = Some(Adopt {
+                session,
+                address,
+                connection: None,
+            });
+        }
     }
 
     pub fn edit_connection(&mut self, id: &ConnectionId) {
@@ -167,6 +215,7 @@ impl Bezel {
             group: connection.group.clone(),
             error: None,
             saving: None,
+            session: None,
         }));
     }
 
@@ -208,6 +257,9 @@ impl Bezel {
             credential: form.credential.clone(),
             group: form.group.clone(),
         };
+        if let Some(adopt) = &mut form.session {
+            adopt.connection = Some(connection.id.clone());
+        }
         let change = match form.editing.clone() {
             Some(original) => Change::EditConnection {
                 original,
@@ -460,7 +512,7 @@ impl Bezel {
     /// baseline (see `follow`), and a password typed for one account is cleared when the
     /// Credential's username changes, so it never reaches another account.
     pub(crate) fn follow_library(&mut self) {
-        self.follow_retry();
+        self.follow_retries();
         let Some(snapshot) = self.library.ready() else { return };
         match &mut self.sheet {
             Some(Sheet::Connection(form)) => {
@@ -507,7 +559,13 @@ impl Bezel {
             Some(Sheet::Connection(form)) if form.saving == Some(id) => {
                 form.saving = None;
                 match error {
-                    None => self.sheet = None,
+                    None => {
+                        let adopt = form.session.take();
+                        self.sheet = None;
+                        if let Some(adopt) = adopt {
+                            self.adopt(adopt);
+                        }
+                    }
                     Some(e) => form.error = Some(e.into()),
                 }
             }
@@ -531,6 +589,23 @@ impl Bezel {
             _ => return false,
         }
         true
+    }
+
+    /// The New host Session becomes the Session of the Connection just saved from it, if that
+    /// Connection reaches the address the Session does.
+    fn adopt(&mut self, adopt: Adopt) {
+        let saved = adopt
+            .connection
+            .and_then(|id| self.library.ready()?.connection(&id))
+            .filter(|c| c.address() == adopt.address)
+            .map(Destination::connection);
+        let Some(saved) = saved else { return };
+        if let Some(session) = self
+            .session_mut(adopt.session)
+            .filter(|s| s.to.connection.is_none() && s.to.address == adopt.address)
+        {
+            session.to = saved;
+        }
     }
 
     /// A sidebar row or Group header dragged: it follows the pointer, and a drop on a section

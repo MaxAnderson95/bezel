@@ -1,58 +1,58 @@
-//! The Main window: a deep titlebar band with the status line, the sidebar, and the raised
-//! panel holding the connect box, the remote desktop and the dialogs. Every colour, type style
-//! and radius comes from the kit.
+//! Bezel's windows as drawn. The Main window has a deep titlebar band with the tab row, the
+//! sidebar, and the raised panel holding the current Tab's Session or the connect box. A
+//! Session window has a thin title bar over its Session. Every colour, type style and radius
+//! comes from the kit.
 
 use bezel_core::library::{Credential, CredentialId};
 use bezel_core::trust::{Certificate, Fingerprint, Question};
 use bezel_rdp::{Ended, Input, MouseButton};
 use rune::{Cx, El, Phase as DragPhase, PointerButton, PopupMenu, Tx, col, el, icon, row, text};
 use rune_kit::{
-    Button, ButtonVariant, Checkbox, ControlSize, Dialog, Field, IconButton, IconButtonVariant, Kit, Select,
-    SelectAppearance, Spinner, TextInput,
+    Button, ButtonVariant, Checkbox, ControlSize, Dialog, Field, Kit, Select, SelectAppearance, Spinner, TextInput,
 };
 use rune_theme_opencode::icons;
 
-use crate::app::{Bezel, Library, Live, Phase, Prompt, Retry, Screen, SignIn, Trust};
-use crate::{pointer, sheets, sidebar};
+use crate::app::{Bezel, Library, Live, Phase, Prompt, Retry, Screen, Session, SessionId, SignIn, Trust};
+use crate::windows::Window;
+use crate::{palette, pointer, sheets, sidebar, tabs};
 
-const TITLEBAR: f32 = 40.0;
 /// The bezel: the gap between the panel's edge and the remote desktop.
 const INSET: f32 = 4.0;
 
 pub fn view(s: &Bezel, cx: &mut Cx<Bezel>) -> El {
+    match s.here.window {
+        Window::Main => main_window(s, cx),
+        Window::Session(id) => session_window(s, id, cx),
+    }
+}
+
+fn main_window(s: &Bezel, cx: &mut Cx<Bezel>) -> El {
     let k = rune_theme_opencode::kit(s.dark(cx.system_dark()));
     let scale = cx.env().scale;
+    let full = cx.is_full_screen();
     let mut layer = Vec::new();
     sheets::sheet(s, k, &mut layer);
-    let content = match &s.screen {
-        Screen::Idle => idle(s, k),
-        Screen::SignIn(sign_in) => {
-            sign_in_dialog(s, sign_in, k, &mut layer);
-            idle(s, k)
-        }
-        Screen::Unlocking(unlocking) => connecting(k, &unlocking.to.name),
-        Screen::Retry(retry) => retry_card(s, retry, k),
-        Screen::Session(live) => {
-            if let Some(prompt) = &live.certificate {
-                certificate_dialog(prompt, k, &s.library, &mut layer);
-            }
-            let mut stage = col().w_full().h_full().child(session(s, live, k, scale));
-            if let Some(message) = &s.notice {
-                stage = stage.child(
-                    col().absolute(16.0, 16.0).w(420.0).child(
-                        notice(k, message, "", false).child(
-                            Button::new("Dismiss")
-                                .control_size(ControlSize::Small)
-                                .on_press(Bezel::dismiss_notice)
-                                .build(k),
-                        ),
-                    ),
-                );
-            }
-            stage
-        }
+    let current = s.active.and_then(|id| s.session(id));
+    let mut content = match current {
+        Some(session) => stage(s, session, k, scale, &mut layer),
+        None => empty(s, k),
     };
+    if let (Some(message), Some(_)) = (&s.notice, current) {
+        content = content.child(
+            col().absolute(16.0, 16.0).w(420.0).child(
+                notice(k, message, "", false).child(
+                    Button::new("Dismiss")
+                        .control_size(ControlSize::Small)
+                        .on_press(Bezel::dismiss_notice)
+                        .build(k),
+                ),
+            ),
+        );
+    }
     sheets::confirm(s, k, &mut layer);
+    palette::floating(s, k, &mut layer);
+    // Last, so the question is the top modal over any palette or sheet.
+    quit_dialog(s, k, &mut layer);
     let area = col()
         .key("area")
         .w_full()
@@ -60,72 +60,149 @@ pub fn view(s: &Bezel, cx: &mut Cx<Bezel>) -> El {
         .min_h(0.0)
         .on_drawn_layout_tx(|s: &mut Bezel, rect, tx: &mut Tx| s.layout_area(rect, tx))
         .child(content);
-    let panel = k
-        .elevate(
-            col()
-                .key("panel")
-                .w_full()
-                .grow(1.0)
-                .min_h(0.0)
-                .padding(INSET)
-                .radius(k.radius.lg)
-                .fill(k.c.bg_base),
-            &k.elevation.raised,
-        )
-        .clip_rounded(k.radius.lg)
-        .child(area);
-    let mut body = row().w_full().grow(1.0).min_h(0.0);
-    if s.sidebar {
-        body = body.child(sidebar::sidebar(s, k));
+    let mut inside = col().w_full().grow(1.0).min_h(0.0);
+    if let Some((session, live)) = current.and_then(|c| Some((c, c.live()?))) {
+        inside = inside.child(status_line(s, session, live, k).key("status-line").px(8.0).h(24.0));
     }
-    body = body.child(
+    let panel = panel(k, inside.child(area));
+    let titlebar = tabs::titlebar(s, k, cx, &mut layer);
+    let window = if full {
+        let mut window = col().w_full().h_full().fill(k.c.bg_deep).child(panel);
+        window = if s.here.reveal {
+            window.child(
+                col()
+                    .key("revealed")
+                    .absolute(0.0, 0.0)
+                    .w_full()
+                    .fill(k.c.bg_deep)
+                    .on_hover_change(|s: &mut Bezel, inside, _: &mut Tx| s.here.reveal = inside)
+                    .child(titlebar),
+            )
+        } else {
+            window.child(
+                el().key("reveal-edge")
+                    .absolute(0.0, 0.0)
+                    .w_full()
+                    .h(4.0)
+                    .on_hover_change(|s: &mut Bezel, inside, _: &mut Tx| s.here.reveal |= inside),
+            )
+        };
+        window
+    } else {
+        let mut body = row().w_full().grow(1.0).min_h(0.0);
+        if s.sidebar {
+            body = body.child(sidebar::sidebar(s, k));
+        }
+        body = body.child(
+            col()
+                .grow(1.0)
+                .min_w(0.0)
+                .h_full()
+                .pr(8.0)
+                .pb(8.0)
+                .pl(if s.sidebar { 0.0 } else { 8.0 })
+                .child(panel),
+        );
+        col().w_full().h_full().fill(k.c.bg_deep).child(titlebar).child(body)
+    };
+    rune_kit::root(window, layer)
+}
+
+/// The raised, rounded panel the remote desktop sits in.
+fn panel(k: &Kit, inside: El) -> El {
+    k.elevate(
         col()
+            .key("panel")
+            .w_full()
             .grow(1.0)
-            .min_w(0.0)
-            .h_full()
-            .pr(8.0)
-            .pb(8.0)
-            .pl(if s.sidebar { 0.0 } else { 8.0 })
-            .child(panel),
-    );
+            .min_h(0.0)
+            .padding(INSET)
+            .radius(k.radius.lg)
+            .fill(k.c.bg_base),
+        &k.elevation.raised,
+    )
+    .clip_rounded(k.radius.lg)
+    .child(inside)
+}
+
+fn session_window(s: &Bezel, id: SessionId, cx: &mut Cx<Bezel>) -> El {
+    let k = rune_theme_opencode::kit(s.dark(cx.system_dark()));
+    let scale = cx.env().scale;
+    let mut layer = Vec::new();
+    let Some(session) = s.session(id) else {
+        return rune_kit::root(col().w_full().h_full().fill(k.c.bg_deep), layer);
+    };
+    let content = stage(s, session, k, scale, &mut layer);
+    palette::floating(s, k, &mut layer);
+    let area = col()
+        .key("area")
+        .w_full()
+        .grow(1.0)
+        .min_h(0.0)
+        .on_drawn_layout_tx(|s: &mut Bezel, rect, tx: &mut Tx| s.layout_area(rect, tx))
+        .child(content);
     let window = col()
         .w_full()
         .h_full()
         .fill(k.c.bg_deep)
-        .child(titlebar(s, k, cx.titlebar_inset()))
-        .child(body);
+        .child(tabs::session_title_bar(s, session, k, cx.titlebar_inset()))
+        .child(
+            col()
+                .w_full()
+                .grow(1.0)
+                .min_h(0.0)
+                .px(6.0)
+                .pb(6.0)
+                .child(panel(k, area)),
+        );
     rune_kit::root(window, layer)
 }
 
-fn titlebar(s: &Bezel, k: &Kit, inset: f32) -> El {
-    let toggle = IconButton::new(&icons::SIDEBAR)
-        .variant(IconButtonVariant::GhostMuted)
-        .control_size(ControlSize::Small)
-        .label(if s.sidebar { "Hide sidebar" } else { "Show sidebar" })
-        .shortcut("⌃⌘S")
-        .on_press(Bezel::toggle_sidebar)
-        .build(k)
-        .key("sidebar-toggle");
-    let mut bar = row()
-        .key("titlebar")
-        .w_full()
-        .h(TITLEBAR)
-        .pl(inset + 8.0)
-        .pr(12.0)
-        .gap(12.0)
-        .center_y()
-        .window_drag()
-        .child(toggle);
-    if s.sidebar {
-        // The status line starts over the panel, clear of the sidebar.
-        bar = bar.child(el().w((sidebar::WIDTH - inset - 8.0 - 24.0 - 12.0 * 2.0).max(0.0)));
-    }
-    let Screen::Session(live) = &s.screen else {
-        return bar.child(text("Bezel").font(k.ty.ui_medium).color(k.c.text_muted));
+/// What a Tab or Session window shows of its Session, with its dialogs in `layer`.
+fn stage(s: &Bezel, session: &Session, k: &Kit, scale: f32, layer: &mut Vec<El>) -> El {
+    let id = session.id;
+    let shown = match &session.screen {
+        Screen::SignIn(sign_in) => {
+            sign_in_dialog(s, session, sign_in, k, layer);
+            el()
+        }
+        Screen::Unlocking(_) => connecting(k, &session.to.name),
+        Screen::Retry(retry) => retry_card(s, session, retry, k),
+        Screen::Live(live) => {
+            if let Some(prompt) = &live.certificate {
+                certificate_dialog(id, prompt, k, &s.library, layer);
+            }
+            desktop(s, session, live, k, scale)
+        }
+        Screen::Ended(ended) => col()
+            .w_full()
+            .h_full()
+            .center()
+            .padding(24.0)
+            .child(col().w_full().max_w(440.0).child(ended_card(Some(id), ended, k))),
     };
+    let mut stage = col().w_full().h_full().child(shown);
+    if let Some(message) = &session.notice {
+        stage = stage.child(
+            col().absolute(16.0, 16.0).w(420.0).child(
+                notice(k, message, "", false).child(
+                    Button::new("Dismiss")
+                        .control_size(ControlSize::Small)
+                        .on_press(move |s: &mut Bezel| s.dismiss_session_notice(id))
+                        .build(k),
+                ),
+            ),
+        );
+    }
+    stage
+}
+
+/// The status line: host, username, the live remote size, and "Trusted" when the certificate
+/// was verified.
+pub fn status_line(s: &Bezel, session: &Session, live: &Live, k: &Kit) -> El {
     let (dot, state) = match live.state {
         Phase::Connected { width, height } => {
-            let retina = s.area.is_some_and(|a| a.scale > 1.0);
+            let retina = s.area_of(s.here.window).is_some_and(|a| a.scale > 1.0);
             (
                 k.c.success.icon,
                 format!("{width} × {height}{}", if retina { " Retina" } else { "" }),
@@ -134,17 +211,19 @@ fn titlebar(s: &Bezel, k: &Kit, inset: f32) -> El {
         Phase::Connecting => (k.c.warning.icon, "Connecting…".into()),
         Phase::Reconnecting => (k.c.warning.icon, "Reconnecting…".into()),
     };
-    bar = bar
+    let mut line = row()
+        .gap(12.0)
+        .center_y()
         .child(el().size(8.0, 8.0).radius(4.0).fill(dot).a11y_hidden())
         .child(
-            text(format!("{}:{}", live.to.address.host, live.to.address.port))
+            text(format!("{}:{}", session.to.address.host, session.to.address.port))
                 .font(k.ty.mono)
                 .color(k.c.text_base),
         )
         .child(text(live.username.clone()).font(k.ty.ui).color(k.c.text_muted))
         .child(text(state).font(k.ty.ui).color(k.c.text_muted));
     if matches!(live.state, Phase::Connected { .. }) && live.trust == Trust::Verified {
-        bar = bar.child(
+        line = line.child(
             row()
                 .gap(4.0)
                 .center_y()
@@ -152,35 +231,13 @@ fn titlebar(s: &Bezel, k: &Kit, inset: f32) -> El {
                 .child(text("Trusted").font(k.ty.ui).color(k.c.text_muted)),
         );
     }
-    bar.child(el().grow(1.0)).child(
-        Button::new("Disconnect")
-            .variant(ButtonVariant::Ghost)
-            .control_size(ControlSize::Small)
-            .on_press(Bezel::disconnect)
-            .build(k),
-    )
+    line
 }
 
-fn idle(s: &Bezel, k: &Kit) -> El {
-    let host = TextInput::new(&s.host)
-        .label("Host")
-        .placeholder("Type a host name to connect")
-        .leading_icon(k.glyph.search)
-        .large()
-        .width(None)
-        .invalid(s.host_error.is_some())
-        .on_edit(|s: &mut Bezel| &mut s.host)
-        .on_change(|s: &mut Bezel, _: &mut Tx| s.host_error = None)
-        .on_submit(|s: &mut Bezel, _: &mut Tx| s.submit_host())
-        .build(k)
-        .key("host");
-    let mut column = col().w_full().max_w(440.0).gap(12.0).child(host);
-    if let Some(error) = &s.host_error {
-        column = column.child(text(error.clone()).font(k.ty.ui).color(k.c.danger.fg));
-    }
-    if let Some(ended) = &s.ended {
-        column = column.child(ended_card(ended, k));
-    }
+/// The Main window's panel with no Tab: the palette's field inline, and on first run a way
+/// to add a Connection.
+fn empty(s: &Bezel, k: &Kit) -> El {
+    let mut column = col().w_full().max_w(440.0).gap(12.0).child(palette::inline(s, k));
     if let Library::Failed(error) = &s.library {
         column = column.child(notice(
             k,
@@ -227,9 +284,42 @@ fn connecting(k: &Kit, name: &str) -> El {
         )
 }
 
+/// ⌘Q with Sessions open.
+fn quit_dialog(s: &Bezel, k: &Kit, layer: &mut Vec<El>) {
+    if !s.quitting {
+        return;
+    }
+    let open = s.sessions.iter().filter(|x| x.is_open()).count();
+    let title = match open {
+        1 => "Disconnect 1 Session and quit?".to_owned(),
+        n => format!("Disconnect {n} Sessions and quit?"),
+    };
+    let body = col().w_full().px(16.0).pb(16.0).child(buttons(
+        Button::new("Cancel")
+            .on_press(Bezel::cancel_quit)
+            .build(k)
+            .key("quit-cancel"),
+        Button::new("Disconnect and quit")
+            .variant(ButtonVariant::Contrast)
+            .on_press_tx(|s: &mut Bezel, tx: &mut Tx| s.quit(tx))
+            .build(k)
+            .key("quit-confirm")
+            .default_button(),
+    ));
+    Dialog::new("quit", title)
+        .description("Windows keeps each user signed in on the server.")
+        .open(true)
+        .fit()
+        .width(400.0)
+        .on_close(Bezel::cancel_quit)
+        .child(body)
+        .build(k, layer);
+}
+
 /// The wrong-password prompt in place of the Session: a new password for the Credential, saved
 /// for every Connection that uses it.
-fn retry_card(s: &Bezel, retry: &Retry, k: &Kit) -> El {
+fn retry_card(s: &Bezel, session: &Session, retry: &Retry, k: &Kit) -> El {
+    let id = session.id;
     let credential = &retry.credential;
     let name = &credential.name;
     let users = s.library.ready().map_or(0, |l| l.used_by(&credential.id).len());
@@ -239,15 +329,18 @@ fn retry_card(s: &Bezel, retry: &Retry, k: &Kit) -> El {
         format!("No password saved for {name}")
     };
     let mut detail = if retry.rejected {
-        format!("{} didn't accept the password. ", retry.to.address.host)
+        format!("{} didn't accept the password. ", session.to.address.host)
     } else {
         String::new()
     };
     detail.push_str(&match users {
-        0 | 1 => format!("Enter the password for {name}; Bezel saves it and signs in to {} again.", retry.to.name),
+        0 | 1 => format!(
+            "Enter the password for {name}; Bezel saves it and signs in to {} again.",
+            session.to.name
+        ),
         n => format!(
             "Enter the password for {name}; Bezel saves it for the {n} connections that use it and signs in to {} again.",
-            retry.to.name
+            session.to.name
         ),
     });
     let label = format!("Password for {}", credential.username);
@@ -256,11 +349,13 @@ fn retry_card(s: &Bezel, retry: &Retry, k: &Kit) -> El {
         .width(None)
         .secure()
         .invalid(retry.error.is_some())
-        .on_edit(|s: &mut Bezel| match &mut s.screen {
-            Screen::Retry(retry) => &mut retry.password,
-            _ => &mut s.host,
+        .on_edit(move |s: &mut Bezel| {
+            s.field(id, |screen| match screen {
+                Screen::Retry(retry) => Some(&mut retry.password),
+                _ => None,
+            })
         })
-        .on_submit(|s: &mut Bezel, _: &mut Tx| s.retry())
+        .on_submit(move |s: &mut Bezel, _: &mut Tx| s.retry(id))
         .build(k)
         .key("retry-password");
     let mut card = col()
@@ -285,11 +380,13 @@ fn retry_card(s: &Bezel, retry: &Retry, k: &Kit) -> El {
     }
     let saving = retry.saving();
     card = card.child(buttons(
-        Button::new("Cancel").on_press(Bezel::cancel_sign_in).build(k),
+        Button::new("Cancel")
+            .on_press(move |s: &mut Bezel| s.cancel_sign_in(id))
+            .build(k),
         Button::new(if saving { "Saving…" } else { "Save and retry" })
             .variant(ButtonVariant::Contrast)
             .disabled(saving)
-            .on_press(Bezel::retry)
+            .on_press(move |s: &mut Bezel| s.retry(id))
             .build(k)
             .key("retry-save")
             .default_button(),
@@ -297,8 +394,25 @@ fn retry_card(s: &Bezel, retry: &Retry, k: &Kit) -> El {
     col().w_full().h_full().center().padding(24.0).child(card)
 }
 
-fn ended_card(ended: &Ended, k: &Kit) -> El {
+/// Why the Session ended, with Copy details, and Close for a Session's own Tab or window.
+pub fn ended_card(id: Option<SessionId>, ended: &Ended, k: &Kit) -> El {
     let details = ended.details.clone();
+    let mut actions = row().gap(4.0).center_y().child(
+        Button::new("Copy details")
+            .variant(ButtonVariant::Ghost)
+            .control_size(ControlSize::Small)
+            .on_press_tx(move |_: &mut Bezel, tx: &mut Tx| tx.copy(details.clone()))
+            .build(k),
+    );
+    if let Some(id) = id {
+        actions = actions.child(
+            Button::new("Close")
+                .control_size(ControlSize::Small)
+                .on_press(move |s: &mut Bezel| s.close(id))
+                .build(k)
+                .key("ended-close"),
+        );
+    }
     col()
         .key("ended")
         .w_full()
@@ -320,13 +434,7 @@ fn ended_card(ended: &Ended, k: &Kit) -> El {
                         .grow(1.0)
                         .shrink(),
                 )
-                .child(
-                    Button::new("Copy details")
-                        .variant(ButtonVariant::Ghost)
-                        .control_size(ControlSize::Small)
-                        .on_press_tx(move |_: &mut Bezel, tx: &mut Tx| tx.copy(details.clone()))
-                        .build(k),
-                ),
+                .child(actions),
         )
 }
 
@@ -369,52 +477,58 @@ pub fn notice(k: &Kit, message: &str, detail: &str, open_folder: bool) -> El {
     card
 }
 
-fn sign_in_dialog(s: &Bezel, sign_in: &SignIn, k: &Kit, layer: &mut Vec<El>) {
-    let waiting = s.is_waiting();
+fn sign_in_dialog(s: &Bezel, session: &Session, sign_in: &SignIn, k: &Kit, layer: &mut Vec<El>) {
+    let id = session.id;
+    let waiting = sign_in.waiting();
     let credentials = s.library.ready().map(|l| l.credentials.as_slice()).unwrap_or_default();
     let mut body = col().w_full().gap(16.0).px(16.0).pb(16.0);
     if !credentials.is_empty() {
         let current = sign_in
             .credential
             .as_ref()
-            .and_then(|id| credentials.iter().find(|c| &c.id == id))
+            .and_then(|c| credentials.iter().find(|x| &x.id == c))
             .map_or(TYPE_IT.to_owned(), |c| c.name.clone());
+        let choices = std::iter::once((None, TYPE_IT.to_owned()))
+            .chain(credentials.iter().map(|c| (Some(c.id.clone()), c.name.clone())))
+            .collect();
         body = body.child(
             Field::new()
                 .label("Credential")
-                .control(credential_picker(
+                .control(picker(
                     k,
                     "sign-in-credential",
-                    credentials,
-                    sign_in.credential.as_ref(),
-                    TYPE_IT,
+                    "Credential",
                     &current,
-                    |s: &mut Bezel, picked| s.sign_in_with(picked),
+                    choices,
+                    &sign_in.credential,
+                    move |s: &mut Bezel, picked| s.sign_in_with(id, picked),
                 ))
                 .build(k),
         );
     }
     if sign_in.credential.is_none() {
-        body = body.child(sign_in_fields(sign_in, k));
+        body = body.child(sign_in_fields(id, sign_in, k));
     }
     if let Some(error) = &sign_in.error {
         body = body.child(text(error.clone()).font(k.ty.ui).color(k.c.danger.fg).wrap().w_full());
     }
     body = body.child(buttons(
-        Button::new("Cancel").on_press(Bezel::cancel_sign_in).build(k),
+        Button::new("Cancel")
+            .on_press(move |s: &mut Bezel| s.cancel_sign_in(id))
+            .build(k),
         Button::new(if waiting { "Connecting…" } else { "Connect" })
             .variant(ButtonVariant::Contrast)
             .disabled(waiting)
-            .on_press(Bezel::sign_in)
+            .on_press(move |s: &mut Bezel| s.sign_in(id))
             .build(k)
             .key("sign-in-connect")
             .default_button(),
     ));
-    Dialog::new("sign-in", format!("Sign in to {}", sign_in.to.name))
+    Dialog::new("sign-in", format!("Sign in to {}", session.to.name))
         .open(true)
         .fit()
         .width(400.0)
-        .on_close(Bezel::cancel_sign_in)
+        .on_close(move |s: &mut Bezel| s.cancel_sign_in(id))
         .child(body)
         .build(k, layer);
 }
@@ -422,44 +536,44 @@ fn sign_in_dialog(s: &Bezel, sign_in: &SignIn, k: &Kit, layer: &mut Vec<El>) {
 /// The sign-in picker's choice for typing a username and password.
 const TYPE_IT: &str = "Type a username and password";
 
-fn sign_in_fields(sign_in: &SignIn, k: &Kit) -> El {
+fn sign_in_fields(id: SessionId, sign_in: &SignIn, k: &Kit) -> El {
+    type Pick = fn(&mut Screen) -> Option<&mut rune::TextEdit>;
+    let input = move |edit: &rune::TextEdit, label: &'static str, pick: Pick| {
+        TextInput::new(edit)
+            .label(label)
+            .width(None)
+            .on_edit(move |s: &mut Bezel| s.field(id, pick))
+            .on_submit(move |s: &mut Bezel, _: &mut Tx| s.sign_in(id))
+    };
     let username = Field::new()
         .label("Username")
         .control(
-            TextInput::new(&sign_in.username)
-                .label("Username")
-                .placeholder(r"DOMAIN\user, user@domain or user")
-                .width(None)
-                .on_edit(|s: &mut Bezel| match &mut s.screen {
-                    Screen::SignIn(sign_in) => &mut sign_in.username,
-                    _ => &mut s.host,
-                })
-                .on_submit(|s: &mut Bezel, _: &mut Tx| s.sign_in())
-                .build(k)
-                .key("sign-in-username"),
+            input(&sign_in.username, "Username", |screen| match screen {
+                Screen::SignIn(sign_in) => Some(&mut sign_in.username),
+                _ => None,
+            })
+            .placeholder(r"DOMAIN\user, user@domain or user")
+            .build(k)
+            .key("sign-in-username"),
         )
         .build(k);
     let password = Field::new()
         .label("Password")
         .control(
-            TextInput::new(&sign_in.password)
-                .label("Password")
-                .width(None)
-                .secure()
-                .invalid(sign_in.error.is_some())
-                .on_edit(|s: &mut Bezel| match &mut s.screen {
-                    Screen::SignIn(sign_in) => &mut sign_in.password,
-                    _ => &mut s.host,
-                })
-                .on_submit(|s: &mut Bezel, _: &mut Tx| s.sign_in())
-                .build(k)
-                .key("sign-in-password"),
+            input(&sign_in.password, "Password", |screen| match screen {
+                Screen::SignIn(sign_in) => Some(&mut sign_in.password),
+                _ => None,
+            })
+            .secure()
+            .invalid(sign_in.error.is_some())
+            .build(k)
+            .key("sign-in-password"),
         )
         .build(k);
     let mut fields = col().w_full().gap(16.0).child(username).child(password).child(
         Checkbox::new(sign_in.save)
             .label("Save as credential")
-            .on_toggle(Bezel::toggle_save_credential)
+            .on_toggle(move |s: &mut Bezel| s.toggle_save_credential(id))
             .build(k)
             .key("sign-in-save"),
     );
@@ -468,17 +582,13 @@ fn sign_in_fields(sign_in: &SignIn, k: &Kit) -> El {
             Field::new()
                 .label("Credential name")
                 .control(
-                    TextInput::new(&sign_in.save_name)
-                        .label("Credential name")
-                        .placeholder("Domain admin")
-                        .width(None)
-                        .on_edit(|s: &mut Bezel| match &mut s.screen {
-                            Screen::SignIn(sign_in) => &mut sign_in.save_name,
-                            _ => &mut s.host,
-                        })
-                        .on_submit(|s: &mut Bezel, _: &mut Tx| s.sign_in())
-                        .build(k)
-                        .key("sign-in-save-name"),
+                    input(&sign_in.save_name, "Credential name", |screen| match screen {
+                        Screen::SignIn(sign_in) => Some(&mut sign_in.save_name),
+                        _ => None,
+                    })
+                    .placeholder("Domain admin")
+                    .build(k)
+                    .key("sign-in-save-name"),
                 )
                 .build(k),
         );
@@ -512,7 +622,7 @@ pub fn picker<T: Clone + PartialEq + 'static>(
     label: &str,
     choices: Vec<(T, String)>,
     current: &T,
-    pick: fn(&mut Bezel, T),
+    pick: impl Fn(&mut Bezel, T) + Clone + 'static,
 ) -> El {
     let menu = picker_menu(&choices, current);
     Select::new(key, &[label])
@@ -521,7 +631,7 @@ pub fn picker<T: Clone + PartialEq + 'static>(
         .appearance(SelectAppearance::Field)
         .fill()
         .on_toggle_tx(move |_: &mut Bezel, tx: &mut Tx| {
-            let choices = choices.clone();
+            let (choices, pick) = (choices.clone(), pick.clone());
             tx.popup_menu(
                 menu.clone(),
                 format!("{key}-trigger"),
@@ -557,11 +667,13 @@ pub fn buttons(secondary: El, primary: El) -> El {
         .child(primary)
 }
 
-fn certificate_dialog(prompt: &Prompt, k: &Kit, library: &Library, layer: &mut Vec<El>) {
+fn certificate_dialog(id: SessionId, prompt: &Prompt, k: &Kit, library: &Library, layer: &mut Vec<El>) {
     let host = &prompt.request.host;
     // Without its saved certificates Bezel can't tell a new certificate from a changed one,
     // and can't save one either.
     let unreadable = matches!(library, Library::Failed(_));
+    let trust = move |s: &mut Bezel| s.trust(id);
+    let refuse = move |s: &mut Bezel| s.refuse_certificate(id);
     let dialog = match &prompt.request.question {
         Question::FirstUse(certificate) => {
             let body = col()
@@ -579,15 +691,15 @@ fn certificate_dialog(prompt: &Prompt, k: &Kit, library: &Library, layer: &mut V
                             ""
                         })
                         .disabled(unreadable)
-                        .on_toggle(Bezel::toggle_remember)
+                        .on_toggle(move |s: &mut Bezel| s.toggle_remember(id))
                         .build(k)
                         .key("certificate-remember"),
                 )
                 .child(buttons(
-                    Button::new("Cancel").on_press(Bezel::refuse_certificate).build(k),
+                    Button::new("Cancel").on_press(refuse).build(k),
                     Button::new("Trust and connect")
                         .variant(ButtonVariant::Contrast)
-                        .on_press(Bezel::trust)
+                        .on_press(trust)
                         .build(k)
                         .key("certificate-trust")
                         .default_button(),
@@ -599,12 +711,12 @@ fn certificate_dialog(prompt: &Prompt, k: &Kit, library: &Library, layer: &mut V
         Question::Changed { presented, .. } if prompt.confirming => {
             let body = col().w_full().gap(16.0).px(16.0).pb(16.0).child(buttons(
                 Button::new("Cancel")
-                    .on_press(|s: &mut Bezel| s.confirm_change(false))
+                    .on_press(move |s: &mut Bezel| s.confirm_change(id, false))
                     .build(k)
                     .default_button(),
                 Button::new("Trust new certificate")
                     .variant(ButtonVariant::Danger)
-                    .on_press(Bezel::trust)
+                    .on_press(trust)
                     .build(k),
             ));
             Dialog::new("certificate", format!("Trust the new certificate for {host}?"))
@@ -635,24 +747,16 @@ fn certificate_dialog(prompt: &Prompt, k: &Kit, library: &Library, layer: &mut V
             let body = col().w_full().gap(16.0).px(16.0).pb(16.0).child(changed).child(buttons(
                 Button::new("Trust new certificate…")
                     .variant(ButtonVariant::Danger)
-                    .on_press(|s: &mut Bezel| s.confirm_change(true))
+                    .on_press(move |s: &mut Bezel| s.confirm_change(id, true))
                     .build(k),
-                Button::new("Don't connect")
-                    .on_press(Bezel::refuse_certificate)
-                    .build(k)
-                    .default_button(),
+                Button::new("Don't connect").on_press(refuse).build(k).default_button(),
             ));
             Dialog::new("certificate", format!("{host} has a different certificate"))
                 .description("Someone may be intercepting the connection, or the server's certificate was replaced.")
                 .child(body)
         }
     };
-    dialog
-        .open(true)
-        .fit()
-        .width(480.0)
-        .on_close(Bezel::refuse_certificate)
-        .build(k, layer);
+    dialog.open(true).fit().width(480.0).on_close(refuse).build(k, layer);
 }
 
 fn facts(k: &Kit, certificate: &Certificate) -> El {
@@ -708,8 +812,17 @@ pub fn grouped(fingerprint: Fingerprint) -> String {
         .join(" ")
 }
 
-fn session(s: &Bezel, live: &Live, k: &Kit, scale: f32) -> El {
-    let Some(area) = s.area else { return el() };
+/// The element key of the Session's remote desktop. Each Session has its own, so switching
+/// Tabs mounts the new one, which takes the keyboard.
+pub fn desktop_key(id: SessionId) -> String {
+    format!("desktop-{id}")
+}
+
+fn desktop(s: &Bezel, session: &Session, live: &Live, k: &Kit, scale: f32) -> El {
+    let Some(area) = s.area_of(s.here.window) else {
+        return el();
+    };
+    let id = session.id;
     let frame = match live.state {
         Phase::Connected { width, height } => Some((width, height)),
         Phase::Connecting | Phase::Reconnecting => {
@@ -718,21 +831,14 @@ fn session(s: &Bezel, live: &Live, k: &Kit, scale: f32) -> El {
         }
     };
     let Some(frame) = frame else {
-        return col()
-            .w_full()
-            .h_full()
-            .center()
-            .gap(12.0)
-            .child(Spinner::new().build(k))
-            .child(
-                text(format!("Connecting to {}…", live.to.name))
-                    .font(k.ty.ui)
-                    .color(k.c.text_muted),
-            );
+        return connecting(k, &session.to.name);
     };
     let [width, height] = desktop_size([area.width, area.height], frame, scale);
+    let key = desktop_key(id);
+    let focus = key.clone();
+    let refocus = key.clone();
     let mut desktop = el()
-        .key("desktop")
+        .key(key)
         .label("Remote desktop")
         .size(width, height)
         .pixels(live.handle.framebuffer())
@@ -744,12 +850,15 @@ fn session(s: &Bezel, live: &Live, k: &Kit, scale: f32) -> El {
             PointerButton::Back,
             PointerButton::Forward,
         ])
-        .on_mount(|_: &mut Bezel, tx: &mut Tx| tx.focus("desktop", false))
+        .on_mount(move |_: &mut Bezel, tx: &mut Tx| tx.focus(focus.clone(), false))
         .on_pointer_move_local(move |s: &mut Bezel, p, tx: &mut Tx| {
-            s.input(Input::PointerMove {
-                x: p.x / width,
-                y: p.y / height,
-            });
+            s.input(
+                id,
+                Input::PointerMove {
+                    x: p.x / width,
+                    y: p.y / height,
+                },
+            );
             tx.live_only();
         })
         .on_drag(move |s: &mut Bezel, d, tx: &mut Tx| {
@@ -761,25 +870,28 @@ fn session(s: &Bezel, live: &Live, k: &Kit, scale: f32) -> El {
                 PointerButton::Forward => MouseButton::Forward,
                 _ => return,
             };
-            s.input(Input::PointerMove {
-                x: d.x / width,
-                y: d.y / height,
-            });
+            s.input(
+                id,
+                Input::PointerMove {
+                    x: d.x / width,
+                    y: d.y / height,
+                },
+            );
             match d.phase {
                 DragPhase::Down => {
-                    tx.focus("desktop", false);
-                    s.input(Input::Button { button, pressed: true });
+                    tx.focus(refocus.clone(), false);
+                    s.input(id, Input::Button { button, pressed: true });
                 }
-                DragPhase::Up => s.input(Input::Button { button, pressed: false }),
+                DragPhase::Up => s.input(id, Input::Button { button, pressed: false }),
                 DragPhase::Move => tx.live_only(),
             }
         })
-        .on_wheel(|s: &mut Bezel, e, tx: &mut Tx| {
-            s.input(Input::Wheel { dx: e.dx, dy: e.dy });
+        .on_wheel(move |s: &mut Bezel, e, tx: &mut Tx| {
+            s.input(id, Input::Wheel { dx: e.dx, dy: e.dy });
             tx.live_only();
             true
         })
-        .on_physical_input(|s: &mut Bezel, e, _: &mut Tx| s.physical(e));
+        .on_physical_input(move |s: &mut Bezel, e, tx: &mut Tx| s.physical(id, e, tx));
     if live.state == Phase::Reconnecting {
         desktop = desktop.opacity(0.4);
     }
