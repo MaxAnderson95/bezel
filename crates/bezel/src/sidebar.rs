@@ -41,6 +41,7 @@ fn search(k: &Kit) -> El {
         .radius(k.radius.md)
         .fill(k.c.layer_01)
         .border(1.0, k.c.border_weak)
+        .hover_motion(rune::Anim::INSTANT, rune::Anim::INSTANT)
         .child(rune::icon(k.glyph.search, 14.0).color(k.c.icon_faint))
         .child(
             text("Connect or search")

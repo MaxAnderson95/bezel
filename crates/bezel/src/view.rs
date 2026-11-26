@@ -38,16 +38,12 @@ fn main_window(s: &Bezel, cx: &mut Cx<Bezel>) -> El {
         None => empty(s, k),
     };
     if let (Some(message), Some(_)) = (&s.notice, current) {
-        content = content.child(
-            col().absolute(16.0, 16.0).w(420.0).child(
-                notice(k, message, "", false).child(
-                    Button::new("Dismiss")
-                        .control_size(ControlSize::Small)
-                        .on_press(Bezel::dismiss_notice)
-                        .build(k),
-                ),
-            ),
-        );
+        content = content.child(col().absolute(16.0, 16.0).w(420.0).child(notice(
+            k,
+            message,
+            "",
+            dismiss(k, Bezel::dismiss_notice),
+        )));
     }
     sheets::confirm(s, k, &mut layer);
     palette::floating(s, k, &mut layer);
@@ -183,16 +179,12 @@ fn stage(s: &Bezel, session: &Session, k: &Kit, scale: f32, layer: &mut Vec<El>)
     };
     let mut stage = col().w_full().h_full().child(shown);
     if let Some(message) = &session.notice {
-        stage = stage.child(
-            col().absolute(16.0, 16.0).w(420.0).child(
-                notice(k, message, "", false).child(
-                    Button::new("Dismiss")
-                        .control_size(ControlSize::Small)
-                        .on_press(move |s: &mut Bezel| s.dismiss_session_notice(id))
-                        .build(k),
-                ),
-            ),
-        );
+        stage = stage.child(col().absolute(16.0, 16.0).w(420.0).child(notice(
+            k,
+            message,
+            "",
+            dismiss(k, move |s: &mut Bezel| s.dismiss_session_notice(id)),
+        )));
     }
     stage
 }
@@ -243,7 +235,10 @@ fn empty(s: &Bezel, k: &Kit) -> El {
             k,
             error,
             "Bezel can't show or save connections, credentials or certificates until the file is fixed.",
-            true,
+            Button::new("Open data folder")
+                .control_size(ControlSize::Small)
+                .on_press(Bezel::open_data_folder)
+                .build(k),
         ));
     }
     if s.library.ready().is_some_and(|l| l.connections.is_empty()) {
@@ -258,14 +253,7 @@ fn empty(s: &Bezel, k: &Kit) -> El {
         );
     }
     if let Some(error) = &s.notice {
-        column = column.child(
-            notice(k, error, "", false).child(
-                Button::new("Dismiss")
-                    .control_size(ControlSize::Small)
-                    .on_press(Bezel::dismiss_notice)
-                    .build(k),
-            ),
-        );
+        column = column.child(notice(k, error, "", dismiss(k, Bezel::dismiss_notice)));
     }
     col().w_full().h_full().center().padding(24.0).child(column)
 }
@@ -449,7 +437,8 @@ pub fn ended_card(id: Option<SessionId>, ended: &Ended, k: &Kit) -> El {
         )
 }
 
-pub fn notice(k: &Kit, message: &str, detail: &str, open_folder: bool) -> El {
+/// A problem worth reading, with its one action.
+fn notice(k: &Kit, message: &str, detail: &str, action: El) -> El {
     let mut card = col()
         .w_full()
         .gap(8.0)
@@ -473,15 +462,15 @@ pub fn notice(k: &Kit, message: &str, detail: &str, open_folder: bool) -> El {
                 .w_full(),
         );
     }
-    if open_folder {
-        card = card.child(
-            Button::new("Open data folder")
-                .control_size(ControlSize::Small)
-                .on_press(Bezel::open_data_folder)
-                .build(k),
-        );
-    }
-    card
+    // In a row, so the button keeps its own width.
+    card.child(row().w_full().child(action))
+}
+
+fn dismiss(k: &Kit, act: impl Fn(&mut Bezel) + Clone + 'static) -> El {
+    Button::new("Dismiss")
+        .control_size(ControlSize::Small)
+        .on_press(act)
+        .build(k)
 }
 
 fn sign_in_dialog(s: &Bezel, session: &Session, sign_in: &SignIn, k: &Kit, layer: &mut Vec<El>) {
@@ -683,25 +672,23 @@ fn certificate_dialog(id: SessionId, prompt: &Prompt, k: &Kit, library: &Library
     let refuse = move |s: &mut Bezel| s.refuse_certificate(id);
     let dialog = match &prompt.request.question {
         Question::FirstUse(certificate) => {
+            let mut remember = Checkbox::new(prompt.remember)
+                .label("Remember this certificate")
+                .disabled(unreadable)
+                .on_toggle(move |s: &mut Bezel| s.toggle_remember(id));
+            // An empty description still takes a line, which pushes the label above the box.
+            if unreadable {
+                remember = remember.description(
+                    "Bezel can't read its saved certificates, so it can't tell whether this one changed or remember it",
+                );
+            }
             let body = col()
                 .w_full()
                 .gap(16.0)
                 .px(16.0)
                 .pb(16.0)
                 .child(facts(k, certificate))
-                .child(
-                    Checkbox::new(prompt.remember)
-                        .label("Remember this certificate")
-                        .description(if unreadable {
-                            "Bezel can't read its saved certificates, so it can't tell whether this one changed or remember it"
-                        } else {
-                            ""
-                        })
-                        .disabled(unreadable)
-                        .on_toggle(move |s: &mut Bezel| s.toggle_remember(id))
-                        .build(k)
-                        .key("certificate-remember"),
-                )
+                .child(remember.build(k).key("certificate-remember"))
                 .child(buttons(
                     Button::new("Cancel").on_press(refuse).build(k),
                     Button::new("Trust and connect")
@@ -756,7 +743,11 @@ fn certificate_dialog(id: SessionId, prompt: &Prompt, k: &Kit, library: &Library
                     .variant(ButtonVariant::Danger)
                     .on_press(move |s: &mut Bezel| s.confirm_change(id, true))
                     .build(k),
-                Button::new("Don't connect").on_press(refuse).build(k).default_button(),
+                Button::new("Don't connect")
+                    .variant(ButtonVariant::Contrast)
+                    .on_press(refuse)
+                    .build(k)
+                    .default_button(),
             ));
             Dialog::new("certificate", format!("{host} has a different certificate"))
                 .description("Someone may be intercepting the connection, or the server's certificate was replaced.")
