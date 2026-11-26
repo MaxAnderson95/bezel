@@ -195,7 +195,10 @@ impl Engine {
             .with_desktop_updates()
             .with_auto_reconnect(RECONNECT_TRIES);
         let input = client.input_sender();
-        let client = client.with_cliprdr_backend_factory(self.clipboard.factory(input.clone()));
+        let cliprdr = input.clone();
+        let client = client.with_cliprdr_backend_factory(self.clipboard.factory(Arc::new(move |message| {
+            let _ = cliprdr.send_clipboard(message);
+        })));
         let mut attempt = Attempt {
             input,
             outbox: Outbox::default(),
@@ -230,6 +233,12 @@ impl Engine {
             let resize = sleep_until(attempt.resize_at);
             tokio::select! {
                 () = &mut run, if running => running = false,
+                // IronRDP checks with the engine only between tries, and a server can take a
+                // try's connection and then say nothing.
+                () = sleep_until(attempt.dropped.map(|at| at + RECONNECT_FOR)) => {
+                    info!(host = %self.target.host, "the connection did not come back in time");
+                    return Outcome::Ended(disconnected(failure::not_back(None, &self.target.host)));
+                }
                 () = sleep_until(attempt.retry_at) => {
                     attempt.retry_at = None;
                     attempt.flush();
@@ -372,7 +381,9 @@ impl Engine {
                         Failure::SignIn { wrong_password, ended } => Event::SignInFailed { wrong_password, ended },
                         // The last try to reconnect failed: the drop is what the person needs
                         // to hear about.
-                        Failure::Ended(_) if attempt.dropped.is_some() => disconnected(failure::not_back(&error, host)),
+                        Failure::Ended(_) if attempt.dropped.is_some() => {
+                            disconnected(failure::not_back(Some(&error), host))
+                        }
                         Failure::Ended(ended) => disconnected(ended),
                     },
                 ));
@@ -386,7 +397,7 @@ impl Engine {
                     Err(error) => {
                         warn!(%host, error = %error.report(), "session lost");
                         match attempt.dropped {
-                            Some(_) => failure::not_back(&error, host),
+                            Some(_) => failure::not_back(Some(&error), host),
                             None => failure::lost(&error, host),
                         }
                     }
