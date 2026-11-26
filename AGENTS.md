@@ -31,8 +31,10 @@ cargo clippy --workspace --all-targets -- -D warnings
 cargo test --workspace
 cargo run -p bezel                                  # the app
 target/debug/bezel --list-scenes                    # fixture scenes
-target/debug/bezel --snap out.png --scene certificate --theme dark --scale 2
+target/debug/bezel --snap out.png --scene certificate --theme dark --scale 2 --settle
+BEZEL_UPDATE_GOLDENS=1 cargo test -p bezel --test goldens   # after an intended visual change
 scripts/bundle.sh                                   # Bezel.app for this Mac
+scripts/icon.sh                                     # assets/Bezel.icns from assets/bezel.svg
 ```
 
-Views use `rune-kit` components and `rune-theme-opencode` tokens only: no colour literals. Render every view you touch with `--snap` in light and dark. Behaviour against a real Windows host is checked by hand with `docs/testing.md`.
+Views use `rune-kit` components and `rune-theme-opencode` tokens only: no colour literals. Render every view you touch with `--snap` in light and dark. Every scene has goldens in light and dark (`crates/bezel/tests/golden`), compared by `cargo test`; a new scene fails until its goldens are written, and every changed golden is looked at before it is committed. Renders that miss land in `target/tmp/golden-actual`, which CI uploads as an artifact. Behaviour against a real Windows host is checked by hand with `docs/testing.md`.
