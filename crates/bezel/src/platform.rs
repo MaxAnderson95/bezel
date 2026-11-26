@@ -21,7 +21,8 @@ pub fn log_dir() -> PathBuf {
     }
 }
 
-fn data_dir() -> PathBuf {
+/// `~/Library/Application Support/Bezel` on macOS, the folder `bezel.toml` lives in.
+pub fn data_dir() -> PathBuf {
     if cfg!(target_os = "macos") {
         home().join("Library/Application Support/Bezel")
     } else {
@@ -108,3 +109,24 @@ pub fn quiet_system_edit_items() {
 
 #[cfg(not(target_os = "macos"))]
 pub fn quiet_system_edit_items() {}
+
+/// The Mac clipboard's plain text, or `None` when it holds none. Only the text is read, so an
+/// image on the clipboard is never converted; AppKit allows it off the main thread.
+#[cfg(target_os = "macos")]
+pub fn clipboard_text() -> Option<String> {
+    use objc2::rc::autoreleasepool;
+    use objc2_app_kit::NSPasteboard;
+    use objc2_foundation::NSString;
+
+    autoreleasepool(|_| {
+        // NSPasteboardTypeString.
+        let plain = NSString::from_str("public.utf8-plain-text");
+        let text = NSPasteboard::generalPasteboard().stringForType(&plain)?.to_string();
+        Some(text).filter(|t| !t.is_empty())
+    })
+}
+
+#[cfg(not(target_os = "macos"))]
+pub fn clipboard_text() -> Option<String> {
+    None
+}

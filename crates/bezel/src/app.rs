@@ -5,9 +5,10 @@
 //! Credentials, Settings, dragging) is in `manage`.
 
 use std::cell::RefCell;
+use std::path::PathBuf;
 use std::rc::Rc;
 use std::sync::mpsc;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use bezel_core::address::Address;
 use bezel_core::keys::{KeyOutcome, Keyboard, Shortcut};
@@ -16,7 +17,7 @@ use bezel_core::secrets::Secret;
 use bezel_core::trust::{Question, TrustedCertificate};
 use bezel_core::usernames::Username;
 use bezel_rdp::{Auth, CertificateRequest, Ended, Event, Input, Pointer, SessionHandle, State, Target, View};
-use rune::{AppHandle, ClipboardContent, Key, KeyEvent, PhysicalInput, TextEdit, Tx, Waker, WindowHandle};
+use rune::{AppHandle, Key, KeyEvent, PhysicalInput, TextEdit, Tx, Waker, WindowHandle};
 use rune_kit::shell::TabDragState;
 
 use crate::keychain::Keychain;
@@ -68,10 +69,22 @@ pub struct Bezel {
     /// The menus claim no key the Session should have (see `platform::release_menu_keys`).
     menus_ready: bool,
     next_request: RequestId,
-    /// The Mac clipboard's change count Bezel last read, while a Session is live to share it.
-    pasteboard: Option<u64>,
+    pasteboard: Pasteboard,
     /// Text a Session copied, for the Mac's clipboard.
     to_mac: Option<String>,
+    /// The data folder, made and waiting to be shown in Finder.
+    data_folder: Option<PathBuf>,
+}
+
+/// Bezel's watch on the Mac's clipboard while a Session is live to share it.
+#[derive(Default)]
+struct Pasteboard {
+    /// The change count the text was last read at.
+    seen: Option<u64>,
+    /// When the change count was last looked at.
+    checked: Option<Instant>,
+    /// The read in flight; an older one's text is stale.
+    reading: Option<RequestId>,
 }
 
 pub enum Library {
@@ -93,6 +106,10 @@ enum Message {
     /// From the engine with this ID, which one Session's `Live` names.
     Engine(u64, Event),
     Store(Reply),
+    /// The Mac clipboard's text, read for the request with this ID.
+    MacText(RequestId, Option<String>),
+    /// The data folder, made if it was missing.
+    DataFolder(Result<PathBuf, String>),
 }
 
 pub type SessionId = u64;
@@ -392,8 +409,9 @@ impl Bezel {
             last_username: String::new(),
             menus_ready: false,
             next_request: 0,
-            pasteboard: None,
+            pasteboard: Pasteboard::default(),
             to_mac: None,
+            data_folder: None,
         }
     }
 
@@ -426,6 +444,7 @@ impl Bezel {
             self.changed();
         }
         self.share_clipboard(tx);
+        self.show_data_folder(tx);
         self.title_window(tx);
         let fresh = self.here.seen != self.generation;
         self.here.seen = self.generation;
@@ -440,6 +459,14 @@ impl Bezel {
             match message {
                 Message::Store(reply) => self.on_store(reply),
                 Message::Engine(engine, event) => self.on_engine(engine, event),
+                Message::MacText(id, text) => {
+                    if self.pasteboard.reading == Some(id) {
+                        self.pasteboard.reading = None;
+                        self.mac_copied(text);
+                    }
+                }
+                Message::DataFolder(Ok(folder)) => self.data_folder = Some(folder),
+                Message::DataFolder(Err(e)) => self.folder_failed(e),
             }
         }
         changed
@@ -447,28 +474,41 @@ impl Bezel {
 
     /// Copies what a Session copied to the Mac's clipboard, and while any Session is live,
     /// offers each one the Mac's text whenever its clipboard changes. The change count costs
-    /// nothing to read, so it is checked a few times a second; the text is read only when it
-    /// moves.
+    /// nothing to read, so it is checked a few times a second, however often the desktop
+    /// redraws; the text alone is read, off this thread, only when the count moves.
     fn share_clipboard(&mut self, tx: &mut Tx) {
         if let Some(text) = self.to_mac.take() {
             tx.copy(text);
         }
         if !self.sessions.iter().any(|s| s.live().is_some()) {
-            self.pasteboard = None;
+            self.pasteboard = Pasteboard::default();
             return;
         }
-        let changes = rune::clipboard::revision();
-        if changes.is_some() && changes != self.pasteboard {
-            self.pasteboard = changes;
-            tx.read_clipboard(|s: &mut Bezel, content: &ClipboardContent, _: &mut Tx| s.mac_copied(content));
-        }
         tx.wake_after(CLIPBOARD_CHECK);
+        let now = Instant::now();
+        if self.pasteboard.checked.is_some_and(|at| now - at < CLIPBOARD_CHECK) {
+            return;
+        }
+        self.pasteboard.checked = Some(now);
+        let changes = rune::clipboard::revision();
+        if changes.is_none() || changes == self.pasteboard.seen {
+            return;
+        }
+        let id = self.request();
+        let (outbox, alarm) = (self.outbox.clone(), self.alarm.clone());
+        let read = std::thread::Builder::new().name("mac clipboard".into()).spawn(move || {
+            let _ = outbox.send(Message::MacText(id, platform::clipboard_text()));
+            alarm.ring();
+        });
+        if read.is_ok() {
+            self.pasteboard.seen = changes;
+            self.pasteboard.reading = Some(id);
+        }
     }
 
-    /// The Mac's clipboard holds `content`: each live Session's Windows is offered its text
+    /// The Mac's clipboard holds `text`, or no text: each live Session's Windows is offered it
     /// unless Windows has it already, as when it copied it.
-    pub(crate) fn mac_copied(&mut self, content: &ClipboardContent) {
-        let text = Some(content.text()).filter(|t| !t.is_empty()).map(str::to_owned);
+    pub(crate) fn mac_copied(&mut self, text: Option<String>) {
         for session in &mut self.sessions {
             if let Screen::Live(live) = &mut session.screen
                 && live.offered != text
@@ -476,6 +516,42 @@ impl Bezel {
                 live.handle.set_clipboard(text.clone());
                 live.offered = text.clone();
             }
+        }
+    }
+
+    /// Open data folder: the folder is made first, off this thread, as a new Library has none
+    /// until its first save; Finder shows it once it exists.
+    pub fn open_data_folder(&mut self) {
+        self.open_folder(platform::data_dir());
+    }
+
+    fn open_folder(&mut self, folder: PathBuf) {
+        let (outbox, alarm) = (self.outbox.clone(), self.alarm.clone());
+        let made = std::thread::Builder::new().name("data folder".into()).spawn(move || {
+            let made = std::fs::create_dir_all(&folder)
+                .map(|()| folder.clone())
+                .map_err(|e| format!("Bezel couldn't make its data folder {}. {e}", folder.display()));
+            let _ = outbox.send(Message::DataFolder(made));
+            alarm.ring();
+        });
+        if let Err(e) = made {
+            self.folder_failed(format!("Bezel couldn't open its data folder. {e}"));
+        }
+    }
+
+    /// Shows the data folder in Finder once it exists.
+    fn show_data_folder(&mut self, tx: &mut Tx) {
+        let Some(folder) = self.data_folder.take() else { return };
+        if let Err(e) = tx.open_path(&folder) {
+            self.folder_failed(format!("Bezel couldn't open {}. {e}", folder.display()));
+        }
+    }
+
+    /// Says why the data folder can't be shown: in the Settings sheet when it is open.
+    fn folder_failed(&mut self, message: String) {
+        match &mut self.sheet {
+            Some(Sheet::Settings(sheet)) => sheet.error = Some(message),
+            _ => self.notice = Some(message),
         }
     }
 
@@ -1102,7 +1178,7 @@ impl Bezel {
             });
         }
         // Read the Mac's clipboard again, to offer the new Session what it holds.
-        self.pasteboard = None;
+        self.pasteboard = Pasteboard::default();
     }
 
     /// An event from the engine `engine`, for the Session it belongs to.
@@ -1126,6 +1202,12 @@ impl Bezel {
         match event {
             Event::State(State::Connecting) => live.state = Phase::Connecting,
             Event::State(State::Connected { width, height }) => {
+                // The engine dropped what was typed while not connected, and Windows starts a
+                // (re)connection with nothing held: the keyboard starts over too, and the next
+                // key's modifier snapshot presses whatever is still held.
+                if !matches!(live.state, Phase::Connected { .. }) {
+                    live.keyboard = Keyboard::new(live.keyboard.command_key());
+                }
                 live.state = Phase::Connected { width, height };
                 self.assign_when_signed_in(id);
             }

@@ -1269,14 +1269,14 @@ fn text_copied_in_one_session_reaches_the_mac_and_every_other_session() {
     let Fixture { mut bezel, _alive, .. } = fixture();
     let dc01 = live_tab(&mut bezel, "n_dc01", None, 701);
     let dc02 = live_tab(&mut bezel, "n_dc02", None, 702);
-    bezel.mac_copied(&ClipboardContent::new("copied on the Mac"));
+    bezel.mac_copied(Some("copied on the Mac".into()));
     assert_eq!(offered(&bezel, dc01), Some("copied on the Mac"));
     assert_eq!(offered(&bezel, dc02), Some("copied on the Mac"));
     // dc01's Windows copies: its text is for the Mac, and dc01 has it already.
     bezel.on_engine(701, Event::Clipboard(Some("copied in dc01".into())));
     assert_eq!(bezel.to_mac.as_deref(), Some("copied in dc01"));
     assert_eq!(offered(&bezel, dc01), Some("copied in dc01"));
-    bezel.mac_copied(&ClipboardContent::new("copied in dc01"));
+    bezel.mac_copied(Some("copied in dc01".into()));
     assert_eq!(offered(&bezel, dc02), Some("copied in dc01"), "pasted in dc02");
     // Something other than text copied in dc02 leaves the Mac alone, and dc02 is offered the
     // Mac's text again the next time it changes.
@@ -1284,10 +1284,10 @@ fn text_copied_in_one_session_reaches_the_mac_and_every_other_session() {
     bezel.on_engine(702, Event::Clipboard(None));
     assert_eq!(bezel.to_mac, None);
     assert_eq!(offered(&bezel, dc02), None);
-    bezel.mac_copied(&ClipboardContent::new("copied in dc01"));
+    bezel.mac_copied(Some("copied in dc01".into()));
     assert_eq!(offered(&bezel, dc02), Some("copied in dc01"));
     // No text on the Mac (an image, say) is offered as nothing.
-    bezel.mac_copied(&ClipboardContent::default());
+    bezel.mac_copied(None);
     assert_eq!((offered(&bezel, dc01), offered(&bezel, dc02)), (None, None));
 }
 
@@ -1406,4 +1406,49 @@ fn command_comma_on_the_desktop_opens_settings_and_command_q_taps_no_windows_key
         KeyOutcome::Send(Vec::new()),
         "⌘'s key-up after the question is no lone Windows key tap"
     );
+}
+
+#[test]
+fn keys_held_while_reconnecting_are_pressed_again_once_connected() {
+    let Fixture { mut bezel, _alive, .. } = fixture();
+    let id = live_tab(&mut bezel, "n_dc01", None, 701);
+    bezel.on_engine(701, connected());
+    hold_shift(&mut bezel, id);
+    bezel.on_engine(
+        701,
+        Event::State(State::Connected {
+            width: 1024,
+            height: 640,
+        }),
+    );
+    assert!(holds_keys(&mut bezel, id), "a new size keeps the keys held");
+    bezel.on_engine(701, Event::State(State::Reconnecting));
+    // Shift went down during the outage, when the engine sent nothing.
+    hold_shift(&mut bezel, id);
+    bezel.on_engine(701, connected());
+    assert!(
+        !holds_keys(&mut bezel, id),
+        "the keyboard starts over, so the next key presses Shift for the new connection"
+    );
+}
+
+#[test]
+fn open_data_folder_makes_the_folder_first_and_says_when_it_cannot() {
+    let Fixture { mut bezel, _alive, .. } = fixture();
+    let home = tempfile::tempdir().unwrap();
+    let folder = home.path().join("Application Support").join("Bezel");
+    bezel.open_folder(folder.clone());
+    wait_until(&mut bezel, |b| b.data_folder.is_some());
+    assert!(folder.is_dir(), "made before Finder is asked to show it");
+    bezel.data_folder = None;
+    // Under a file, no folder can be made.
+    let file = home.path().join("file");
+    std::fs::write(&file, "").unwrap();
+    bezel.open_settings();
+    bezel.open_folder(file.join("Bezel"));
+    wait_until(
+        &mut bezel,
+        |b| matches!(&b.sheet, Some(Sheet::Settings(s)) if s.error.is_some()),
+    );
+    assert!(bezel.data_folder.is_none());
 }

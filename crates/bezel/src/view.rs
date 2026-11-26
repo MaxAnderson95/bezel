@@ -477,11 +477,7 @@ pub fn notice(k: &Kit, message: &str, detail: &str, open_folder: bool) -> El {
         card = card.child(
             Button::new("Open data folder")
                 .control_size(ControlSize::Small)
-                .on_press_tx(|_: &mut Bezel, tx: &mut Tx| {
-                    if let Some(folder) = crate::platform::library_file().parent() {
-                        let _ = tx.open_path(folder);
-                    }
-                })
+                .on_press(Bezel::open_data_folder)
                 .build(k),
         );
     }
