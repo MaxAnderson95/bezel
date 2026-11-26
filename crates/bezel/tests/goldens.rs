@@ -55,14 +55,9 @@ fn every_scene_matches_its_golden() {
         }
     }
     // A golden no scene renders would otherwise stay, and its screen go untested, unnoticed.
-    for entry in std::fs::read_dir(&goldens).unwrap() {
-        let path = entry.unwrap().path();
-        let name = path.file_name().and_then(|n| n.to_str()).unwrap_or_default().to_owned();
-        if expected.contains(&name) {
-            continue;
-        }
+    for name in orphans(&goldens, &expected) {
         if update {
-            std::fs::remove_file(path).unwrap();
+            std::fs::remove_file(goldens.join(&name)).unwrap();
         } else {
             misses.push(format!("{name}: no scene renders it; run with BEZEL_UPDATE_GOLDENS=1"));
         }
@@ -74,6 +69,27 @@ fn every_scene_matches_its_golden() {
         actual.display(),
         misses.join("\n")
     );
+}
+
+/// The goldens in `dir` that are not `expected`. Only PNGs are goldens: Finder's `.DS_Store`
+/// and other files there are left alone.
+fn orphans(dir: &Path, expected: &[String]) -> Vec<String> {
+    let mut orphans: Vec<String> = std::fs::read_dir(dir)
+        .unwrap()
+        .filter_map(|entry| entry.unwrap().file_name().into_string().ok())
+        .filter(|name| name.ends_with(".png") && !expected.contains(name))
+        .collect();
+    orphans.sort();
+    orphans
+}
+
+#[test]
+fn only_pngs_no_scene_renders_are_orphans() {
+    let dir = tempfile::tempdir().unwrap();
+    for name in [".DS_Store", "notes.txt", "tabs-light.png", "gone-dark.png"] {
+        std::fs::write(dir.path().join(name), b"").unwrap();
+    }
+    assert_eq!(orphans(dir.path(), &["tabs-light.png".to_owned()]), ["gone-dark.png"]);
 }
 
 /// Bezel with its logs and data under `home`, never the person's.
