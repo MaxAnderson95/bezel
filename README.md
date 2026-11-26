@@ -24,7 +24,7 @@ open target/release/Bezel.app
 
 Press ⌘K, type a host name (`dc01.corp.lan`, `dc01:3390` or an IP address) and press Return. Bezel opens each Session in a Tab and asks for `DOMAIN\user`, `user@domain` or a local `user` and its password. It signs in with Kerberos when it can find a domain controller, NTLM otherwise, and shows the Windows login screen on servers with Network Level Authentication off.
 
-The same ⌘K palette finds open Sessions and saved Connections by name or host: Return opens or switches to one, ⌘Return opens it in its own window, and ⌥Return edits it. ⌘1 to ⌘9 and ⇧⌘[ / ⇧⌘] switch Tabs, ⌘W disconnects one, and ⌃⌘F goes full screen. Drag a Tab off the tab row, or choose Move to new window, to give a Session its own window; Move to main window or dragging it back onto the tab row makes it a Tab again.
+The same ⌘K palette finds open Sessions and saved Connections by name or host: Return opens or switches to one, and ⌘Return opens it in its own window. ⌥Return edits a saved Connection, or opens another Session of one already open. ⌘1 to ⌘9 and ⇧⌘[ / ⇧⌘] switch Tabs, ⌘W disconnects one, and ⌃⌘F goes full screen. Drag a Tab off the tab row, or choose Move to new window, to give a Session its own window; Move to main window or dragging it back onto the tab row makes it a Tab again.
 
 Save servers with + at the foot of the sidebar (New connection, New group). Clicking a Connection signs in with its Credential, or asks for a username and password when it is set to "Ask each time". Right-click a Connection or Group for Edit, Duplicate, Move to group, Rename and Delete, or drag Connections between Groups and Groups into a new order. ⌃⌘S hides the sidebar.
 

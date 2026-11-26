@@ -7,7 +7,8 @@ Run before calling a milestone done. The automated checks (`cargo test --workspa
 - Build with `scripts/bundle.sh` and open `target/release/Bezel.app`; the bundle declares Retina support and carries the icon. Check the Dock and Finder show the ember icon.
 - Hosts: Windows Server 2019, Windows Server 2022, Windows Server 2025 and Windows 11, each joined to a test domain, each with a local `administrator`, and each with its self-signed RDP certificate. The Sign-in section turns NLA off on one of them.
 - A Mac with a Retina display and a non-Retina external display.
-- Start from an empty data folder: quit Bezel, move `~/Library/Application Support/Bezel` aside, and delete any `io.github.maxanderson95.bezel.*` items in Keychain Access.
+- Start from an empty data folder: quit Bezel and move `~/Library/Application Support/Bezel` aside. Leave Keychain Access alone: the passwords of your own Credentials are named by Credential IDs that only the moved `bezel.toml` knows, so Bezel neither sees nor changes them during the run, and they work again once the folder is back.
+- Every Credential the checklist changes or deletes is one made during the run. At the end, delete each of them in Credentials (which removes its Keychain item), quit Bezel, and move your folder back in place of the test one.
 
 ## Every host
 
