@@ -127,6 +127,14 @@ pub(crate) fn lost(error: &dyn Error, host: &str) -> Ended {
     Ended::new(format!("The connection to {host} was lost"), error)
 }
 
+/// An ended Session whose link dropped and did not come back while Bezel reconnected.
+pub(crate) fn not_back(error: &dyn Error, host: &str) -> Ended {
+    Ended::new(
+        format!("The connection to {host} was lost and did not come back"),
+        error,
+    )
+}
+
 fn io_kind(error: &(dyn Error + 'static)) -> Option<io::ErrorKind> {
     let mut current = Some(error);
     while let Some(e) = current {

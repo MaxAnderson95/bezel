@@ -1,7 +1,10 @@
 //! One Session with a Windows machine. This crate owns everything IronRDP: the threads and
-//! runtime, configuration, the Retina recipe, resize debouncing, certificate prompts and the
-//! framebuffer. No IronRDP type crosses this interface.
+//! runtime, configuration, the Retina recipe, resize debouncing, certificate prompts, the
+//! framebuffer, reconnecting, the text clipboard and audio. No IronRDP type crosses this
+//! interface.
 
+mod audio;
+mod clipboard;
 mod engine;
 mod failure;
 mod framebuffer;
@@ -100,6 +103,9 @@ pub enum Event {
         wrong_password: bool,
         ended: Ended,
     },
+    /// Windows copied: its text for the Mac's clipboard, or `None` for something other than
+    /// text, which Bezel does not share and which leaves the Mac's clipboard as it is.
+    Clipboard(Option<String>),
 }
 
 #[derive(Clone, Debug, PartialEq)]
@@ -110,7 +116,8 @@ pub enum State {
         width: u16,
         height: u16,
     },
-    /// Reconnecting at a new size because the server cannot resize in place.
+    /// Reconnecting: after the link dropped, for about 30 seconds with the server's
+    /// auto-reconnect cookie, or at a new size because the server cannot resize in place.
     Reconnecting,
     Disconnected(Ended),
 }
@@ -171,6 +178,8 @@ enum Command {
     Input(Input),
     Resize(View),
     CtrlAltDel,
+    Clipboard(Option<String>),
+    Mute(bool),
     Disconnect,
 }
 
@@ -218,6 +227,17 @@ impl SessionHandle {
 
     pub fn send_ctrl_alt_del(&self) {
         let _ = self.commands.send(Command::CtrlAltDel);
+    }
+
+    /// The Mac's clipboard holds this text now, or no text. Windows is offered it to paste,
+    /// on every reconnect too.
+    pub fn set_clipboard(&self, text: Option<String>) {
+        let _ = self.commands.send(Command::Clipboard(text));
+    }
+
+    /// Silences the Session's audio, or plays it again.
+    pub fn set_muted(&self, muted: bool) {
+        let _ = self.commands.send(Command::Mute(muted));
     }
 
     /// Ends the Session; Windows keeps the user signed in.

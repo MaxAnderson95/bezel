@@ -179,7 +179,7 @@ fn stage(s: &Bezel, session: &Session, k: &Kit, scale: f32, layer: &mut Vec<El>)
             .h_full()
             .center()
             .padding(24.0)
-            .child(col().w_full().max_w(440.0).child(ended_card(Some(id), ended, k))),
+            .child(col().w_full().max_w(560.0).child(ended_card(Some(id), ended, k))),
     };
     let mut stage = col().w_full().h_full().child(shown);
     if let Some(message) = &session.notice {
@@ -394,7 +394,8 @@ fn retry_card(s: &Bezel, session: &Session, retry: &Retry, k: &Kit) -> El {
     col().w_full().h_full().center().padding(24.0).child(card)
 }
 
-/// Why the Session ended, with Copy details, and Close for a Session's own Tab or window.
+/// Why the Session ended, with Copy details, and Close and Reconnect for a Session's own Tab
+/// or window.
 pub fn ended_card(id: Option<SessionId>, ended: &Ended, k: &Kit) -> El {
     let details = ended.details.clone();
     let mut actions = row().gap(4.0).center_y().child(
@@ -405,13 +406,23 @@ pub fn ended_card(id: Option<SessionId>, ended: &Ended, k: &Kit) -> El {
             .build(k),
     );
     if let Some(id) = id {
-        actions = actions.child(
-            Button::new("Close")
-                .control_size(ControlSize::Small)
-                .on_press(move |s: &mut Bezel| s.close(id))
-                .build(k)
-                .key("ended-close"),
-        );
+        actions = actions
+            .child(
+                Button::new("Close")
+                    .control_size(ControlSize::Small)
+                    .on_press(move |s: &mut Bezel| s.close(id))
+                    .build(k)
+                    .key("ended-close"),
+            )
+            .child(
+                Button::new("Reconnect")
+                    .variant(ButtonVariant::Contrast)
+                    .control_size(ControlSize::Small)
+                    .on_press(move |s: &mut Bezel| s.reconnect(id))
+                    .build(k)
+                    .key("ended-reconnect")
+                    .default_button(),
+            );
     }
     col()
         .key("ended")

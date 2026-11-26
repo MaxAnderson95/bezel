@@ -144,6 +144,25 @@ pub struct Settings {
     pub remember_certificates: bool,
 }
 
+/// One setting changed, leaving the others as they are on disk.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Setting {
+    Appearance(Appearance),
+    CommandKey(CommandKey),
+    RememberCertificates(bool),
+}
+
+impl Settings {
+    pub fn with(mut self, setting: Setting) -> Self {
+        match setting {
+            Setting::Appearance(appearance) => self.appearance = appearance,
+            Setting::CommandKey(command_key) => self.command_key = command_key,
+            Setting::RememberCertificates(remember) => self.remember_certificates = remember,
+        }
+        self
+    }
+}
+
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "lowercase")]
 pub enum Appearance {
@@ -314,7 +333,7 @@ pub enum Change {
     },
     /// Its Connections switch to asking each time, and its password is removed.
     DeleteCredential(CredentialId),
-    Settings(Settings),
+    Setting(Setting),
 }
 
 #[derive(Debug, thiserror::Error)]
@@ -693,7 +712,7 @@ impl File {
                 }
                 return Ok(Some((id, None)));
             }
-            Change::Settings(settings) => self.settings.item = settings,
+            Change::Setting(setting) => self.settings.item = self.settings.item.with(setting),
         }
         Ok(None)
     }
@@ -1119,6 +1138,29 @@ mod tests {
         }
         assert!(!text.contains("hunter2"), "{text}");
         assert_eq!(open(&path).snapshot(), library.snapshot());
+    }
+
+    #[test]
+    fn a_setting_changes_alone_and_keeps_the_others_as_they_are_on_disk() {
+        let (_dir, path) = temp_path();
+        let mut library = open(&path);
+        library
+            .apply(Change::Setting(Setting::Appearance(Appearance::Dark)))
+            .unwrap();
+        let text = fs::read_to_string(&path)
+            .unwrap()
+            .replace("command_key = \"mac-shortcuts\"", "command_key = \"windows-key\"");
+        fs::write(&path, text).unwrap();
+        library
+            .apply(Change::Setting(Setting::RememberCertificates(true)))
+            .unwrap();
+        let expected = Settings {
+            appearance: Appearance::Dark,
+            command_key: CommandKey::WindowsKey,
+            remember_certificates: true,
+        };
+        assert_eq!(library.snapshot().settings, expected);
+        assert_eq!(open(&path).snapshot().settings, expected);
     }
 
     #[test]
@@ -1660,10 +1702,7 @@ remembered = 2026-10-03
             })
             .unwrap();
         library
-            .apply(Change::Settings(Settings {
-                remember_certificates: true,
-                ..library.snapshot().settings
-            }))
+            .apply(Change::Setting(Setting::RememberCertificates(true)))
             .unwrap();
         library.apply(remember(trusted("fs01.corp.lan", 1))).unwrap();
         let text = fs::read_to_string(&path).unwrap().replace(

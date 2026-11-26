@@ -391,6 +391,11 @@ pub fn on_reopen(s: &mut Bezel, _: bool, _: &mut Tx) -> bool {
 
 /// ⌘Q asks once, in the Main window, when Sessions are open.
 pub fn on_quit_request(s: &mut Bezel, _: &mut Tx) -> QuitResponse {
+    // The app menu takes ⌘Q before the desktop sees Q, so the desktop holding ⌘ would make its
+    // key-up a lone Windows key tap.
+    for id in s.sessions.iter().map(|x| x.id).collect::<Vec<_>>() {
+        s.release_keys(id);
+    }
     if !s.sessions.iter().any(|x| x.is_open()) {
         return QuitResponse::Quit;
     }

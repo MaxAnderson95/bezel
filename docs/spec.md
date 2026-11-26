@@ -22,7 +22,7 @@ File or image clipboard, microphone, RD Gateway, `.rdp` import, multiple monitor
 One Main window, laid out like OpenCode Desktop: a deep-background sidebar on the left and a raised, rounded content panel on the right with a row of Tabs above it. The remote desktop sits inside the panel with a thin inset, which is the "bezel".
 
 - **Sidebar.** A search field at the top ("Connect or search", shows ⌘K) opens the command palette. Below it, Groups in the order Max set, each listing its Connections alphabetically; Connections without a Group appear last under "Ungrouped". A Connection with an open Session shows a status dot (green connected, amber connecting or reconnecting). Hovering a row shows two actions: open in a Session window, and edit. The foot has Credentials, Certificates, Settings and a + button (New connection, New group). A toggle next to the traffic lights hides the sidebar (⌃⌘S).
-- **Tabs.** One per Session: status dot, Connection name (or host for a New host), close button. The row ends with +, which opens the palette. Actions for the current Session sit at the right of the row: Send Ctrl+Alt+Del, Move to new window, Full screen, and a … menu (Mute, Disconnect, Sign out of Windows, Save as Connection for a New host, Copy details).
+- **Tabs.** One per Session: status dot, Connection name (or host for a New host), close button. The row ends with +, which opens the palette. Actions for the current Session sit at the right of the row: Send Ctrl+Alt+Del, Move to new window, Full screen, and a … menu (Mute, Disconnect, Save as Connection for a New host, Copy details). Sign out of Windows joins it once IronRDP can sign out; the pinned revision has no way to.
 - **Status line.** A slim line at the top of the panel: host (mono), username, the live remote size with "Retina", and "Trusted" with a shield when the certificate chain or a Trusted certificate was accepted.
 - **Empty panel.** With no Tab open, including first run, the panel shows the palette's search field inline, with "Type a host name to connect". On first run it also shows an "Add connection" button, and the sidebar reads "No connections yet".
 - Closing the Main window hides it; its Sessions keep running. Clicking the Dock icon or pressing ⌘K shows it again. Launching Bezel opens the Main window with no Tabs.
@@ -48,7 +48,7 @@ Clicking a Connection, or choosing it in the palette, switches to its existing T
 
 ### Closing and quitting
 
-⌘W on a Tab or Session window disconnects without asking; the Windows session stays signed in on the server. Sign out of Windows is a separate … menu item. ⌘Q asks once, "Disconnect 3 Sessions and quit?", when Sessions are open.
+⌘W on a Tab or Session window disconnects without asking; the Windows session stays signed in on the server. ⌘Q asks once, "Disconnect 3 Sessions and quit?", when Sessions are open.
 
 ### Full screen
 
@@ -181,11 +181,11 @@ Pure Rust with no Rune or IronRDP dependency, so it builds and tests fast on any
 
 ### bezel-rdp
 
-The deep module that owns everything IronRDP: threads, the tokio runtime, configuration, the Retina recipe, resize coalescing, reconnects, clipboard and audio backends. Its interface:
+The deep module that owns everything IronRDP: threads, the tokio runtime, configuration, the Retina recipe, resize coalescing, reconnects, clipboard and audio backends ([ADR 0004](adr/0004-bezel-handles-clipboard-and-audio-channels.md)). Its interface:
 
 - `Session::connect(target, auth, events) -> SessionHandle`, where `target` is host, port and the content size in points with its backing scale, and `auth` is a username and password or "login screen".
-- `SessionHandle` methods: `input(event)`, `resize(points, scale)` (callable on every layout change; the engine debounces and applies the Retina recipe), `set_muted(bool)`, `send_ctrl_alt_del()`, `sign_out()`, `disconnect()`.
-- Events out, on one channel: `Frame` (the shared framebuffer changed, with dirty regions), `Pointer` (shape, position, hidden), `State` (connecting, signing in, connected with remote size, reconnecting, disconnected with reason), `Certificate(request)` (the engine pauses the handshake until the app replies through the request with Trust or Cancel), `SignInFailed { wrong_password }`.
+- `SessionHandle` methods: `input(event)`, `resize(points, scale)` (callable on every layout change; the engine debounces and applies the Retina recipe), `set_clipboard(text)` (the Mac's clipboard text, or none), `set_muted(bool)`, `send_ctrl_alt_del()`, `disconnect()`.
+- Events out, on one channel: `Frame` (the shared framebuffer changed, with dirty regions), `Pointer` (shape, position, hidden), `State` (connecting, signing in, connected with remote size, reconnecting, disconnected with reason), `Certificate(request)` (the engine pauses the handshake until the app replies through the request with Trust or Cancel), `SignInFailed { wrong_password }`, `Clipboard(text)` (Windows copied: its text, or none for something other than text).
 
 The app never sees an IronRDP type. Frames land in a framebuffer the engine owns and the app reads; the first version uploads it with `El::pixels` and `Pixels::replace` buffer reuse, and a later version can move to a compositor slot that applies dirty rectangles, without changing this interface.
 

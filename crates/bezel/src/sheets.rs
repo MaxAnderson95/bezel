@@ -1,13 +1,17 @@
 //! The sheets over the Main window: New connection and Edit, New group and Rename, Credentials,
-//! Certificates, and the confirmations for deleting.
+//! Certificates, Settings, and the confirmations for deleting.
 
-use bezel_core::library::{Credential, Snapshot};
+use bezel_core::keys::CommandKey;
+use bezel_core::library::{Appearance, Credential, Setting, Snapshot};
 use rune::{El, TextEdit, Tx, col, el, row, text};
-use rune_kit::{Button, ButtonVariant, ControlSize, Dialog, Field, IconButton, IconButtonVariant, Kit, TextInput};
+use rune_kit::{
+    Button, ButtonVariant, ControlSize, Dialog, Field, IconButton, IconButtonVariant, Kit, SegmentedControl, Switch,
+    TextInput,
+};
 use rune_theme_opencode::icons;
 
 use crate::app::{Bezel, today};
-use crate::manage::{ConnectionForm, Credentials, Delete, GroupForm, Selected, Sheet, default_name};
+use crate::manage::{ConnectionForm, Credentials, Delete, GroupForm, Selected, SettingsSheet, Sheet, default_name};
 use crate::view::{buttons, credential_picker, date, fact, fact_el, fingerprint_text, grouped, picker};
 
 pub fn sheet(s: &Bezel, k: &Kit, layer: &mut Vec<El>) {
@@ -18,6 +22,7 @@ pub fn sheet(s: &Bezel, k: &Kit, layer: &mut Vec<El>) {
         Some(Sheet::Group(form)) => group(form, k, layer),
         Some(Sheet::Credentials(sheet)) => credentials(sheet, snapshot, k, layer),
         Some(Sheet::Certificates) => certificates(snapshot, k, layer),
+        Some(Sheet::Settings(sheet)) => settings(sheet, snapshot, k, layer),
     }
 }
 
@@ -494,6 +499,143 @@ fn certificates(snapshot: &Snapshot, k: &Kit, layer: &mut Vec<El>) {
         .child(list);
     Dialog::new("certificates", "Trusted certificates")
         .description("Bezel connects to these hosts without asking while they present the same certificate.")
+        .open(true)
+        .fit()
+        .width(560.0)
+        .on_close(Bezel::close_sheet)
+        .child(body)
+        .build(k, layer);
+}
+
+/// A setting's title and what it does on the left, its control on the right.
+fn setting_row(k: &Kit, key: &str, title: &str, description: &str, control: El) -> El {
+    row()
+        .key(key.to_owned())
+        .w_full()
+        .gap(16.0)
+        .center_y()
+        .child(
+            col()
+                .grow(1.0)
+                .shrink()
+                .min_w(0.0)
+                .gap(2.0)
+                .child(text(title.to_owned()).font(k.ty.ui_medium).color(k.c.text_base))
+                .child(
+                    text(description.to_owned())
+                        .font(k.ty.ui)
+                        .color(k.c.text_muted)
+                        .wrap()
+                        .w_full(),
+                ),
+        )
+        .child(control)
+}
+
+const APPEARANCES: [(Appearance, &str); 3] = [
+    (Appearance::System, "System"),
+    (Appearance::Light, "Light"),
+    (Appearance::Dark, "Dark"),
+];
+
+const COMMAND_KEYS: [(CommandKey, &str); 2] = [
+    (CommandKey::MacShortcuts, "Mac shortcuts"),
+    (CommandKey::WindowsKey, "Windows key"),
+];
+
+/// Each change is saved as it is made.
+fn settings(sheet: &SettingsSheet, snapshot: &Snapshot, k: &Kit, layer: &mut Vec<El>) {
+    let shown = sheet.shown(snapshot.settings);
+    let segmented = |labels: &[&str], selected: usize, pick: fn(usize) -> Setting| {
+        SegmentedControl::new(labels, Some(selected))
+            .fit()
+            .on_pick(move |s: &mut Bezel, index, _: &mut Tx| s.set_setting(pick(index)))
+            .build(k)
+    };
+    let appearance = segmented(
+        &APPEARANCES.map(|(_, label)| label),
+        APPEARANCES
+            .iter()
+            .position(|(a, _)| *a == shown.appearance)
+            .unwrap_or(0),
+        |index| Setting::Appearance(APPEARANCES[index].0),
+    )
+    .key("settings-appearance");
+    let command_key = segmented(
+        &COMMAND_KEYS.map(|(_, label)| label),
+        COMMAND_KEYS
+            .iter()
+            .position(|(c, _)| *c == shown.command_key)
+            .unwrap_or(0),
+        |index| Setting::CommandKey(COMMAND_KEYS[index].0),
+    )
+    .key("settings-command-key");
+    let remember = shown.remember_certificates;
+    let remember = Switch::new(remember)
+        .label("Remember certificates by default")
+        .hide_label()
+        .on_toggle(move |s: &mut Bezel| s.set_setting(Setting::RememberCertificates(!remember)))
+        .build(k)
+        .key("settings-remember");
+    let folder = Button::new("Open data folder")
+        .control_size(ControlSize::Small)
+        .on_press_tx(|_: &mut Bezel, tx: &mut Tx| {
+            if let Some(folder) = crate::platform::library_file().parent() {
+                let _ = tx.open_path(folder);
+            }
+        })
+        .build(k)
+        .key("settings-data-folder");
+    let mut body = col()
+        .w_full()
+        .gap(20.0)
+        .px(16.0)
+        .pb(16.0)
+        .child(setting_row(
+            k,
+            "settings-appearance-row",
+            "Appearance",
+            "Bezel in light or dark, or as the Mac is set.",
+            appearance,
+        ))
+        .child(setting_row(
+            k,
+            "settings-command-key-row",
+            "⌘ key",
+            match shown.command_key {
+                CommandKey::MacShortcuts => "⌘C and ⌘V copy and paste in Windows, and ⌘ alone opens Start.",
+                CommandKey::WindowsKey => "⌘ is the Windows key in every combination.",
+            },
+            command_key,
+        ))
+        .child(setting_row(
+            k,
+            "settings-remember-row",
+            "Remember certificates by default",
+            "Remember this certificate starts ticked when Bezel asks about a server's certificate.",
+            remember,
+        ))
+        .child(setting_row(
+            k,
+            "settings-data-folder-row",
+            "Data folder",
+            "Connections, groups, credential names and trusted certificates, in bezel.toml.",
+            folder,
+        ));
+    if let Some(message) = &sheet.error {
+        body = body.child(error(k, message));
+    }
+    body = body.child(
+        row().w_full().pt(4.0).child(el().grow(1.0)).child(
+            Button::new("Done")
+                .variant(ButtonVariant::Contrast)
+                .on_press(Bezel::close_sheet)
+                .build(k)
+                .key("settings-done")
+                .default_button(),
+        ),
+    );
+    Dialog::new("settings", "Settings")
         .open(true)
         .fit()
         .width(560.0)

@@ -48,6 +48,7 @@ pub enum Item {
     Edit(ConnectionId),
     Credentials,
     Certificates,
+    Settings,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -138,6 +139,7 @@ pub fn rows(query: &str, sessions: &[Session], library: Option<&Snapshot>) -> Ve
         for (item, title) in [
             (Item::Credentials, "Credentials…"),
             (Item::Certificates, "Certificates…"),
+            (Item::Settings, "Settings…"),
         ] {
             if hit(&[title]) {
                 rows.push(Row {
@@ -260,6 +262,7 @@ impl Bezel {
                     self.open_certificates();
                 }
             }
+            (Item::Settings, _) => self.open_settings(),
         }
     }
 
@@ -326,6 +329,7 @@ fn row_el(entry: &Row, index: usize, selected: bool, k: &Kit) -> El {
         Item::Edit(_) => &icons::PENCIL_LINE,
         Item::Credentials => &icons::LOCK,
         Item::Certificates => &icons::SHIELD,
+        Item::Settings => &icons::SETTINGS_GEAR,
     };
     let mut line = row()
         .key(format!("palette-row-{index}"))
@@ -546,6 +550,7 @@ mod tests {
                 (Section::Saved, "fs01"),
                 (Section::Manage, "Credentials…"),
                 (Section::Manage, "Certificates…"),
+                (Section::Manage, "Settings…"),
             ]
         );
     }

@@ -1,6 +1,6 @@
 //! The Main window's sidebar: Groups in Max's order with their Connections alphabetically,
 //! Ungrouped last, status dots, hover actions, context menus and dragging, and a foot with
-//! Credentials, Certificates and +.
+//! Credentials, Certificates, Settings and +.
 
 use std::rc::Rc;
 
@@ -261,9 +261,9 @@ fn group_menu(id: GroupId, index: usize, count: usize, press: PointerPress, tx: 
 
 fn foot(s: &Bezel, k: &Kit) -> El {
     let ready = s.library.ready().is_some();
-    let link = |label: &'static str, glyph: &'static rune::Icon, key: &'static str, act: fn(&mut Bezel)| {
+    // Text alone, so Settings and + fit beside them.
+    let link = |label: &'static str, key: &'static str, act: fn(&mut Bezel)| {
         Button::new(label)
-            .icon(glyph)
             .variant(ButtonVariant::GhostMuted)
             .control_size(ControlSize::Small)
             .disabled(!ready)
@@ -271,6 +271,15 @@ fn foot(s: &Bezel, k: &Kit) -> El {
             .build(k)
             .key(key)
     };
+    let settings = IconButton::new(&icons::SETTINGS_GEAR)
+        .variant(IconButtonVariant::GhostMuted)
+        .control_size(ControlSize::Small)
+        .label("Settings")
+        .shortcut("⌘,")
+        .disabled(!ready)
+        .on_press(Bezel::open_settings)
+        .build(k)
+        .key("sidebar-settings");
     let add = IconButton::new(&icons::PLUS)
         .variant(IconButtonVariant::GhostMuted)
         .control_size(ControlSize::Small)
@@ -292,15 +301,9 @@ fn foot(s: &Bezel, k: &Kit) -> El {
         .w_full()
         .gap(2.0)
         .center_y()
-        .child(link("Credentials", &icons::LOCK, "sidebar-credentials", |s| {
-            s.open_credentials(None)
-        }))
-        .child(link(
-            "Certificates",
-            &icons::SHIELD,
-            "sidebar-certificates",
-            Bezel::open_certificates,
-        ))
+        .child(link("Credentials", "sidebar-credentials", |s| s.open_credentials(None)))
+        .child(link("Certificates", "sidebar-certificates", Bezel::open_certificates))
         .child(el().grow(1.0))
+        .child(settings)
         .child(add)
 }

@@ -1,10 +1,12 @@
-//! Managing the Library from the Main window: the Connection, Group, Credentials and
-//! Certificates sheets, confirmations, context-menu actions and dragging in the sidebar.
+//! Managing the Library from the Main window: the Connection, Group, Credentials, Certificates
+//! and Settings sheets, confirmations, context-menu actions and dragging in the sidebar.
 
 use std::rc::Rc;
 
 use bezel_core::address::Address;
-use bezel_core::library::{Change, Connection, ConnectionId, Credential, CredentialId, Group, GroupId};
+use bezel_core::library::{
+    Change, Connection, ConnectionId, Credential, CredentialId, Group, GroupId, Setting, Settings,
+};
 use bezel_core::secrets::Secret;
 use bezel_core::trust::Fingerprint;
 use rune::{Drag, Phase, TextEdit, Tx};
@@ -17,6 +19,23 @@ pub enum Sheet {
     Group(GroupForm),
     Credentials(Credentials),
     Certificates,
+    Settings(SettingsSheet),
+}
+
+/// Each setting is saved as soon as it is changed. The sheet shows the Library's settings with
+/// the changes still being saved on top, so a refused one goes back to what is on disk.
+#[derive(Default)]
+pub struct SettingsSheet {
+    saving: Vec<(RequestId, Setting)>,
+    pub error: Option<String>,
+}
+
+impl SettingsSheet {
+    pub fn shown(&self, saved: Settings) -> Settings {
+        self.saving
+            .iter()
+            .fold(saved, |settings, (_, setting)| settings.with(*setting))
+    }
 }
 
 pub struct ConnectionForm {
@@ -502,6 +521,24 @@ impl Bezel {
         self.sheet = Some(Sheet::Certificates);
     }
 
+    /// ⌘, from any window, the sidebar or the palette.
+    pub fn open_settings(&mut self) {
+        if self.library.ready().is_some() && self.ready_to_manage() {
+            self.sheet = Some(Sheet::Settings(SettingsSheet::default()));
+        }
+    }
+
+    pub fn set_setting(&mut self, setting: Setting) {
+        if !matches!(self.sheet, Some(Sheet::Settings(_))) {
+            return;
+        }
+        let request = self.apply(Change::Setting(setting));
+        if let (Some(Sheet::Settings(sheet)), Some(request)) = (&mut self.sheet, request) {
+            sheet.error = None;
+            sheet.saving.push((request, setting));
+        }
+    }
+
     /// Forgets the Trusted certificate the list showed, unless another has replaced it since.
     pub fn forget_certificate(&mut self, host: String, port: u16, sha256: Fingerprint) {
         self.apply(Change::ForgetCertificate { host, port, sha256 });
@@ -548,7 +585,7 @@ impl Bezel {
                 }
                 sheet.selected = Selected::Existing(now.clone());
             }
-            Some(Sheet::Certificates) | None => {}
+            Some(Sheet::Certificates | Sheet::Settings(_)) | None => {}
         }
     }
 
@@ -567,6 +604,12 @@ impl Bezel {
                         }
                     }
                     Some(e) => form.error = Some(e.into()),
+                }
+            }
+            Some(Sheet::Settings(sheet)) if sheet.saving.iter().any(|(saving, _)| *saving == id) => {
+                sheet.saving.retain(|(saving, _)| *saving != id);
+                if let Some(e) = error {
+                    sheet.error = Some(format!("That setting was not saved. {e}"));
                 }
             }
             Some(Sheet::Credentials(sheet)) if sheet.saving == Some(id) => {
