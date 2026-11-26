@@ -10,6 +10,7 @@ use time::macros::date;
 
 use crate::app::{
     Bezel, Destination, Library, Opening, Phase, Screen, Session, fixture_retry, fixture_session, fixture_sign_in,
+    today,
 };
 use crate::manage::Delete;
 use crate::windows::Window;
@@ -343,7 +344,8 @@ fn library() -> Snapshot {
                 id: "c_admin".into(),
                 name: "Domain admin".into(),
                 username: r"CORP\admin.max".into(),
-                password_updated: Some(date!(2026 - 08 - 23)),
+                // Relative to today, as the Credentials window counts the days to it.
+                password_updated: Some(today() - time::Duration::days(95)),
             },
             Credential {
                 id: "c_local".into(),

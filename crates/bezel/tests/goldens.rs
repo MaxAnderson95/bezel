@@ -28,11 +28,13 @@ fn every_scene_matches_its_golden() {
     let _ = std::fs::remove_dir_all(&actual);
     std::fs::create_dir_all(&actual).unwrap();
     std::fs::create_dir_all(&home).unwrap();
-    let update = std::env::var_os("BEZEL_UPDATE_GOLDENS").is_some();
+    let update = std::env::var("BEZEL_UPDATE_GOLDENS").is_ok_and(|v| v == "1");
     if update {
         std::fs::create_dir_all(&goldens).unwrap();
     }
     let scenes = scenes(&home);
+    assert!(!scenes.is_empty(), "bezel --list-scenes listed no scenes");
+    let mut expected = Vec::new();
     let mut misses = Vec::new();
     for scene in &scenes {
         for theme in ["light", "dark"] {
@@ -40,6 +42,7 @@ fn every_scene_matches_its_golden() {
             let render = actual.join(&name);
             snap(&home, scene, theme, &render);
             let golden = goldens.join(&name);
+            expected.push(name.clone());
             if update {
                 std::fs::copy(&render, &golden).unwrap();
                 std::fs::remove_file(&render).unwrap();
@@ -51,22 +54,23 @@ fn every_scene_matches_its_golden() {
             }
         }
     }
-    if update {
-        // A golden for a scene that no longer exists would otherwise stay forever.
-        for entry in std::fs::read_dir(&goldens).unwrap() {
-            let path = entry.unwrap().path();
-            let stem = path.file_stem().and_then(|s| s.to_str()).unwrap_or_default();
-            let scene = stem.trim_end_matches("-light").trim_end_matches("-dark");
-            if !scenes.iter().any(|s| s == scene) {
-                std::fs::remove_file(path).unwrap();
-            }
+    // A golden no scene renders would otherwise stay, and its screen go untested, unnoticed.
+    for entry in std::fs::read_dir(&goldens).unwrap() {
+        let path = entry.unwrap().path();
+        let name = path.file_name().and_then(|n| n.to_str()).unwrap_or_default().to_owned();
+        if expected.contains(&name) {
+            continue;
+        }
+        if update {
+            std::fs::remove_file(path).unwrap();
+        } else {
+            misses.push(format!("{name}: no scene renders it; run with BEZEL_UPDATE_GOLDENS=1"));
         }
     }
     assert!(
         misses.is_empty(),
-        "{} of {} renders missed their goldens; the renders are in {}:\n{}",
+        "{} goldens missed; the renders are in {}:\n{}",
         misses.len(),
-        scenes.len() * 2,
         actual.display(),
         misses.join("\n")
     );
