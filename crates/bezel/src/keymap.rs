@@ -10,6 +10,9 @@ pub enum Translated {
     /// Modifiers held from before the Session had the keyboard, pressed for it first, and what
     /// the key itself makes.
     Key(Vec<KeyOp>, KeyOutcome),
+    /// A modifier change that let go of modifiers held from before: send these, and leave the
+    /// event to Rune.
+    LetGo(Vec<KeyOp>),
     /// The window lost the keyboard; everything held is released.
     FocusLost,
     /// Not the Session's: a key with no PC position, or modifier bookkeeping Rune also sends.
@@ -25,7 +28,10 @@ pub fn translate(keyboard: &mut Keyboard, event: &PhysicalInput) -> Translated {
             }
             None => Translated::Pass,
         },
-        PhysicalInput::Modifiers(_) => Translated::Pass,
+        PhysicalInput::Modifiers(mods) => match keyboard.let_go(held(*mods)) {
+            ops if ops.is_empty() => Translated::Pass,
+            ops => Translated::LetGo(ops),
+        },
         PhysicalInput::FocusLost => {
             keyboard.release_all();
             Translated::FocusLost
@@ -196,8 +202,9 @@ mod tests {
         }
     }
 
-    /// The order winit delivers ⌘C on macOS: the ⌘ key and the modifier change it causes,
-    /// then C pressed and released with ⌘ held, then ⌘ released.
+    /// The order winit delivers ⌘C on macOS: the ⌘ key (still with the modifiers from before
+    /// it) and the modifier change it causes, then C pressed and released with ⌘ held, then ⌘
+    /// released and its modifier change.
     #[test]
     fn command_c_from_macos_reaches_windows_as_control_c() {
         let command = Mods {
@@ -206,11 +213,11 @@ mod tests {
             ..Mods::default()
         };
         let events = [
-            key(K::SuperLeft, true, command),
+            key(K::SuperLeft, true, Mods::default()),
             PhysicalInput::Modifiers(command),
             key(K::KeyC, true, command),
             key(K::KeyC, false, command),
-            key(K::SuperLeft, false, Mods::default()),
+            key(K::SuperLeft, false, command),
             PhysicalInput::Modifiers(Mods::default()),
         ];
         let mut keyboard = Keyboard::new(CommandKey::MacShortcuts);
@@ -231,6 +238,48 @@ mod tests {
                 KeyOp::Release(c),
                 KeyOp::Release(ctrl)
             ]
+        );
+    }
+
+    /// Right ⇧ held from the ⇧⌘] that switched Tabs, A typed, then right ⇧ let go, as winit on
+    /// macOS delivers it: the key-up still with the snapshot from before it, then the modifier
+    /// change. The left ⇧ pressed for the held one goes up with that change, before any other
+    /// key or click reaches Windows, and the change is still Rune's to handle.
+    #[test]
+    fn an_inherited_shift_goes_up_with_the_modifier_change_after_its_key_up() {
+        let shift = Mods {
+            shift: true,
+            ..Mods::default()
+        };
+        let (a, c) = (Scancode::new(0x1E), Scancode::new(0x2E));
+        let mut keyboard = Keyboard::new(CommandKey::MacShortcuts);
+        assert_eq!(
+            translate(&mut keyboard, &key(K::KeyA, true, shift)),
+            Translated::Key(
+                vec![KeyOp::Press(Scancode::SHIFT_LEFT)],
+                KeyOutcome::Send(vec![KeyOp::Press(a)])
+            )
+        );
+        assert_eq!(
+            translate(&mut keyboard, &key(K::KeyA, false, shift)),
+            Translated::Key(vec![], KeyOutcome::Send(vec![KeyOp::Release(a)]))
+        );
+        assert_eq!(
+            translate(&mut keyboard, &key(K::ShiftRight, false, shift)),
+            Translated::Key(vec![], KeyOutcome::Send(vec![]))
+        );
+        assert_eq!(
+            translate(&mut keyboard, &PhysicalInput::Modifiers(Mods::default())),
+            Translated::LetGo(vec![KeyOp::Release(Scancode::SHIFT_LEFT)])
+        );
+        assert_eq!(
+            translate(&mut keyboard, &key(K::KeyC, true, Mods::default())),
+            Translated::Key(vec![], KeyOutcome::Send(vec![KeyOp::Press(c)]))
+        );
+        assert_eq!(
+            translate(&mut keyboard, &PhysicalInput::Modifiers(Mods::default())),
+            Translated::Pass,
+            "a change that lets go of nothing inferred is not Bezel's"
         );
     }
 

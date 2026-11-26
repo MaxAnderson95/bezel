@@ -1181,14 +1181,15 @@ fn a_command_chord_held_across_a_tab_switch_still_switches_tabs() {
         rt.update(|s, tx| taken = s.physical(id, &physical(key, mods), tx));
         assert!(taken);
     };
-    // ⌘2 then, with ⌘ still down in the new Tab, 3.
-    press(&mut rt, K::SuperLeft, command);
+    // ⌘2 then, with ⌘ still down in the new Tab, 3. A modifier key's own event carries the
+    // modifiers from before it, as winit on macOS delivers it.
+    press(&mut rt, K::SuperLeft, Mods::default());
     press(&mut rt, K::Digit2, command);
     assert_eq!(rt.state.active, Some(tabs[1]));
     press(&mut rt, K::Digit3, command);
     assert_eq!(rt.state.active, Some(tabs[2]), "⌘3, not a 3 typed into Tab 2");
     // ⇧⌘] twice without letting go.
-    press(&mut rt, K::ShiftLeft, shift_command);
+    press(&mut rt, K::ShiftLeft, command);
     press(&mut rt, K::BracketRight, shift_command);
     assert_eq!(rt.state.active, Some(tabs[3]));
     press(&mut rt, K::BracketRight, shift_command);

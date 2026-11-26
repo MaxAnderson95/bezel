@@ -1255,6 +1255,10 @@ impl Bezel {
                     KeyOutcome::Shortcut(shortcut) => self.shortcut(shortcut, tx),
                 }
             }
+            Translated::LetGo(ops) => {
+                live.handle.input(Input::Keys(ops));
+                false
+            }
             Translated::Pass => false,
             Translated::FocusLost => {
                 live.handle.input(Input::ReleaseAll);
