@@ -1291,6 +1291,27 @@ fn text_copied_in_one_session_reaches_the_mac_and_every_other_session() {
     assert_eq!((offered(&bezel, dc01), offered(&bezel, dc02)), (None, None));
 }
 
+/// A read of the Mac's clipboard started before a Session copied finds the text the copy
+/// replaces; offering that back would undo the copy in the Session that made it.
+#[test]
+fn a_mac_read_from_before_a_windows_copy_offers_nothing() {
+    let Fixture { mut bezel, _alive, .. } = fixture();
+    let dc01 = live_tab(&mut bezel, "n_dc01", None, 701);
+    let read = bezel.request();
+    bezel.pasteboard.reading = Some(read);
+    bezel.on_engine(701, Event::Clipboard(Some("copied in dc01".into())));
+    // The poll queues the copy for the Mac. Rune hasn't written it yet, so the change count is
+    // still the one from before it, and no read starts on it.
+    bezel.share_clipboard(&mut rune::Tx::default());
+    assert!(bezel.pasteboard.reading.is_none());
+    bezel
+        .outbox
+        .send(Message::MacText(read, Some("copied on the Mac before".into())))
+        .unwrap();
+    bezel.drain();
+    assert_eq!(offered(&bezel, dc01), Some("copied in dc01"));
+}
+
 #[test]
 fn a_session_that_ended_reconnects_as_it_signed_in_and_stays_muted() {
     let Fixture { mut bezel, _alive, .. } = fixture();

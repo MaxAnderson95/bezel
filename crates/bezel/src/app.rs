@@ -479,6 +479,9 @@ impl Bezel {
     fn share_clipboard(&mut self, tx: &mut Tx) {
         if let Some(text) = self.to_mac.take() {
             tx.copy(text);
+            // Rune writes it later, off this thread: until the change count moves past this
+            // one, a read would find the text before it.
+            self.pasteboard.seen = rune::clipboard::revision();
         }
         if !self.sessions.iter().any(|s| s.live().is_some()) {
             self.pasteboard = Pasteboard::default();
@@ -1231,6 +1234,8 @@ impl Bezel {
                 live.offered = text.clone();
                 if text.is_some() {
                     self.to_mac = text;
+                    // A read in flight has the Mac's text from before this copy replaces it.
+                    self.pasteboard.reading = None;
                 }
             }
             Event::SignInFailed { wrong_password, ended } => {
