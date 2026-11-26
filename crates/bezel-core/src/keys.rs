@@ -46,8 +46,9 @@ pub enum KeyOp {
     Release(Scancode),
 }
 
-/// The ⌘ key setting.
-#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+/// The ⌘ key setting, written `mac-shortcuts` or `windows-key` in `bezel.toml`.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+#[serde(rename_all = "kebab-case")]
 pub enum CommandKey {
     /// ⌘ plus an unreserved key is Ctrl plus that key; ⌘ alone is the Windows key.
     #[default]

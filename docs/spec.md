@@ -57,7 +57,7 @@ Clicking a Connection, or choosing it in the palette, switches to its existing T
 ### Sign-in
 
 - A Connection with a Credential signs in with it silently.
-- A Connection set to "Ask each time", or a New host, shows a sign-in sheet: pick an existing Credential or type a username and password, with "Save as Credential" (off by default; asks for a name when ticked).
+- A Connection set to "Ask each time", or a New host, shows a sign-in sheet: pick an existing Credential or type a username and password, with "Save as Credential" (off by default; asks for a name when ticked). A Credential saved there for a Connection becomes that Connection's Credential once the sign-in succeeds.
 - **Wrong password.** When the server rejects the password, the Tab shows "Sign-in failed for Domain admin" with a password field. Saving updates that Credential in the Keychain for every Connection that uses it, then retries. For a one-off typed password, the sheet simply reappears.
 - Methods, tried automatically with nothing to configure: NLA (CredSSP) with Kerberos, finding the domain controller through DNS SRV records and `/etc/krb5.conf`, then NTLM. If the server has NLA turned off, Bezel connects over TLS and shows the Windows login screen, filling in the Credential when there is one. Servers offering only legacy RDP security without TLS are refused with a clear error.
 - Usernames are entered as one field: `DOMAIN\user`, `user@domain` or `user` (a local account). Bezel splits them for the protocol.
@@ -116,7 +116,7 @@ Bezel writes a rotating log to `~/Library/Logs/Bezel`. Passwords and other secre
 
 ## Data
 
-One TOML file, `~/Library/Application Support/Bezel/bezel.toml`, written atomically (write to a temporary file, then rename). Passwords live only in the Keychain under service `io.github.maxanderson95.bezel`, account `<credential id>` ([ADR 0002](adr/0002-toml-file-and-keychain-storage.md)). IDs are random and stable, so renaming never orphans a Keychain item. Array order is display order for Groups.
+One TOML file, `~/Library/Application Support/Bezel/bezel.toml`, written atomically (write to a temporary file, then rename). Passwords live only in the Keychain, one item per Credential with service `io.github.maxanderson95.bezel.<credential id>` and account `<credential id>` ([ADR 0002](adr/0002-toml-file-and-keychain-storage.md)); `rune::Credentials` keeps one item per service. IDs are random and stable, so renaming never orphans a Keychain item. Array order is display order for Groups.
 
 ```toml
 version = 1
@@ -174,7 +174,7 @@ bezel/
 
 Pure Rust with no Rune or IronRDP dependency, so it builds and tests fast on any OS.
 
-- **Library**: the persistent model and its invariants behind a small interface: `Library::open(path, secrets)`, `snapshot()` returning the current Connections, Groups, Credentials, Trusted certificates and Settings, and `apply(Change)` for every mutation (add or edit a Connection, reorder Groups, delete a Credential and reassign its Connections, remember or forget a certificate, change a setting). `apply` validates, updates, and saves atomically. Passwords go through `password(credential)` and `set_password(credential, secret)`. The `Secrets` seam has two adapters: the system credential store through `rune::Credentials` in the app, and an in-memory store in tests.
+- **Library**: the persistent model and its invariants behind a small interface: `Library::open(path, secrets)`, `snapshot()` returning the current Connections, Groups, Credentials, Trusted certificates and Settings, and `apply(Change)` for every mutation (add or edit a Connection, reorder Groups, delete a Credential and reassign its Connections, remember or forget a certificate, change a setting). `apply` validates, updates, and saves atomically. Passwords are read with `password(credential)` and written by the Credential changes (adding one, a new password, deleting one), which keep the Keychain and the file together. The `Secrets` seam has two adapters: the system credential store through `rune::Credentials` in the app, and an in-memory store in tests.
 - **Trust**: one function deciding what to do with a server certificate: given host, port, leaf certificate, whether the platform chain validated, the Trusted certificate for that host if any, and the Session's trusted-once fingerprints, it returns `Accept`, `AskFirstUse(details)` or `AskChanged { trusted, presented }`. Certificate parsing for the dialog's details lives here.
 - **Keys**: maps a physical key event with modifiers and the ⌘ key setting to either a Bezel shortcut or the scancode sequence to send, including the "⌘ alone is the Windows key" rule.
 - **Usernames**: splits `DOMAIN\user`, `user@domain` and `user` into the form the sign-in protocol needs.

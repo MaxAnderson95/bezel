@@ -1,10 +1,14 @@
 //! Bezel, an RDP client for connecting from a Mac to Windows machines.
 
 mod app;
+mod keychain;
 mod keymap;
+mod manage;
 mod platform;
 mod pointer;
 mod scenes;
+mod sheets;
+mod sidebar;
 mod store;
 mod view;
 
@@ -29,6 +33,7 @@ fn main() {
         scenes: scenes::SCENES,
         setup: Some(Bezel::setup),
         poll: Some(Bezel::poll),
+        on_key: Some(Bezel::on_key),
         ..AppSpec::new("Bezel", (1280.0, 800.0), Bezel::new, view::view)
     });
 }
